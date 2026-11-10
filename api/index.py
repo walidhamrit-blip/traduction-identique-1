@@ -30,6 +30,7 @@ from app.errors import (
     PdfServiceError,
 )
 from app.extractor import extract_pdf_layout
+from app.filenames import build_content_disposition
 from app.pipeline import translate_pdf_bytes
 from app.renderer import ensure_fonts_registered, fonts_diagnostics
 from app.sample_generator import generate_sample_pdf
@@ -111,15 +112,13 @@ async def _handle_translate_request(
     # interceptées par le gestionnaire global : plus aucun 500 opaque.
     translated_pdf = translate_pdf_bytes(pdf_bytes, target_lang=target_lang)
 
-    original_stem = Path(file.filename or "document.pdf").stem
-    safe_stem = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in original_stem)
-    out_filename = f"{safe_stem or 'document'}_{target_lang.value}.pdf"
-
+    # En-tête 100 % ASCII (RFC 5987) : un nom de fichier arabe/cyrillique/ accentu\u00e9
+    # ne doit plus provoquer de UnicodeEncodeError -> HTTP 500.
     return Response(
         content=translated_pdf,
         media_type="application/pdf",
         headers={
-            "Content-Disposition": f'inline; filename="{out_filename}"',
+            "Content-Disposition": build_content_disposition(file.filename, target_lang.value),
             "X-Target-Language": target_lang.value,
         },
     )
@@ -211,7 +210,11 @@ def get_sample_pdf() -> Response:
     return Response(
         content=sample_bytes,
         media_type="application/pdf",
-        headers={"Content-Disposition": 'inline; filename="sample_invoice.pdf"'},
+        headers={
+            "Content-Disposition": build_content_disposition(
+                "sample_invoice.pdf", "source"
+            )
+        },
     )
 
 
@@ -594,6 +597,9 @@ def interactive_console() -> HTMLResponse:
         setStatus("Veuillez d'abord sélectionner un fichier PDF ou charger la démo.", "error");
         return;
       }
+      // Le nom du fichier est envoyé via le multipart. Certains navigateurs/clients
+      // transmettent des noms non-ASCII mal encodés : on les assainit côté client
+      // (le serveur gère de toute façon les noms Unicode via RFC 5987).
       const lang = targetLangSelect.value;
       submitBtn.disabled = true;
       setStatus("Extraction pdfminer.six, traduction (" + lang + ") et fusion ReportLab/pypdf en cours...", "info");

@@ -210,3 +210,61 @@ def test_diag_endpoint_reports_fonts_and_versions() -> None:
 def test_health_still_ok() -> None:
     assert client.get("/health").status_code == 200
     assert client.get("/api/health").status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# Non-régression : noms de fichiers non-ASCII (arabe, cyrillique, accents, %)
+# provoquaient « UnicodeEncodeError: 'latin-1' codec can't encode » -> HTTP 500
+# car les en-têtes HTTP ne transportent pas d'Unicode brut (RFC 5987).
+# ---------------------------------------------------------------------------
+
+
+import pytest  # noqa: E402
+from urllib.parse import unquote  # noqa: E402
+
+from app.filenames import build_content_disposition, safe_ascii_stem  # noqa: E402
+
+
+@pytest.mark.parametrize(
+    "filename",
+    [
+        "فاتورة تجارية.pdf",
+        "Facture été 2026.pdf",
+        "договор № 12.pdf",
+        "KONSIMANTO DRAFT ASSADAKA.pdf",
+        "invoice 100%.pdf",
+        "機密文書.pdf",
+    ],
+)
+def test_non_ascii_filename_does_not_break_response(filename: str) -> None:
+    """Le PDF doit être renvoyé (200) et l'en-tête rester 100 % ASCII."""
+    response = client.post(
+        "/translate",
+        files={"file": (filename, generate_sample_pdf(), "application/pdf")},
+        data={"target_lang": "ar"},
+    )
+    assert response.status_code == 200
+    assert response.content.startswith(b"%PDF-")
+
+    disposition = response.headers["content-disposition"]
+    assert disposition.isascii(), disposition
+    assert "filename*=UTF-8''" in disposition
+    # Le nom d'origine reste accessible au navigateur via filename*
+    decoded = unquote(disposition.split("filename*=UTF-8''")[1])
+    assert decoded.endswith("_ar.pdf")
+
+
+def test_content_disposition_header_injection_is_sanitized() -> None:
+    """Guillemets, points-virgules et sauts de ligne ne doivent pas casser l'en-tête."""
+    header = build_content_disposition('evil"; rm -rf.pdf\r\nX-Injected: 1', "en")
+    assert "\r" not in header and "\n" not in header
+    assert header.isascii()
+    assert "X-Injected" not in header or "%" in header
+
+
+def test_safe_ascii_stem_fallbacks() -> None:
+    assert safe_ascii_stem("فاتورة.pdf") == "document"
+    assert safe_ascii_stem("Facture été.pdf") == "Facture_ete"
+    assert safe_ascii_stem(None) == "document"
+    assert safe_ascii_stem("../../etc/passwd.pdf") == "passwd"
+    assert len(safe_ascii_stem("a" * 500 + ".pdf")) <= 80
