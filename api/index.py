@@ -7,6 +7,8 @@ Compatible simultanément avec :
 
 from __future__ import annotations
 
+import io
+import json
 import logging
 from pathlib import Path
 from typing import Annotated
@@ -37,7 +39,15 @@ from app.pipeline import PipelineReport, translate_pdf_bytes
 from app.translation.chain import chain_diagnostics, provider_order
 from app.renderer import ensure_fonts_registered, fonts_diagnostics
 from app.sample_generator import generate_sample_pdf
-from app.schemas import TargetLang
+from app.schemas import BlockEdit, StyleOptions, TargetLang, TextAlign, VerticalAlign
+from app.converters import SUPPORTED_INPUT_FORMATS, to_pdf
+from app.exporters import (
+    SUPPORTED_OUTPUT_FORMATS,
+    export_docx,
+    export_pdf_to_png,
+    export_text,
+)
+from app.fonts import font_catalog
 from app.translator import mock_translate
 
 logger = logging.getLogger(__name__)
@@ -91,43 +101,225 @@ async def _unhandled_error_handler(request: Request, exc: Exception) -> JSONResp
     )
 
 
-async def _handle_translate_request(
-    file: UploadFile,
-    target_lang: TargetLang,
-) -> Response:
-    """Valide l'entrée, exécute le pipeline de traduction PDF et retourne le binaire PDF."""
-    pdf_bytes = await file.read()
-    if not pdf_bytes:
+async def _read_upload(file: UploadFile) -> tuple[bytes, str]:
+    """Lit, valide puis convertit le fichier envoyé en PDF si nécessaire."""
+    content = await file.read()
+    if not content:
         raise EmptyPdfError("Le fichier envoyé est vide.")
 
-    if len(pdf_bytes) > MAX_UPLOAD_BYTES:
+    if len(content) > MAX_UPLOAD_BYTES:
         raise PayloadTooLargeError(
-            f"Le fichier ({len(pdf_bytes) / (1024 * 1024):.1f} Mo) dépasse la taille "
+            f"Le fichier ({len(content) / (1024 * 1024):.1f} Mo) dépasse la taille "
             f"maximale autorisée ({MAX_UPLOAD_MB} Mo)."
         )
 
-    if not pdf_bytes.lstrip().startswith(b"%PDF-"):
+    pdf_bytes, detected_format, _warnings = to_pdf(file.filename, content)
+    return pdf_bytes, detected_format
+
+
+def _parse_style(style_json: str | None) -> StyleOptions:
+    """Désérialise les options de mise en forme envoyées par l'éditeur."""
+    if not style_json:
+        return StyleOptions()
+    try:
+        payload = json.loads(style_json)
+    except ValueError as exc:
         raise InvalidPdfError(
-            "Format invalide : seuls les fichiers PDF valides (%PDF-) sont acceptés."
-        )
+            "Les options de mise en forme ne sont pas un JSON valide.",
+            status_code=400,
+            code="invalid_style",
+        ) from exc
+    if not isinstance(payload, dict):
+        return StyleOptions()
 
-    # `translate_pdf_bytes` lève des `PdfServiceError` typées (400/413/422/503),
-    # interceptées par le gestionnaire global : plus aucun 500 opaque.
-    report = PipelineReport()
-    translated_pdf = translate_pdf_bytes(pdf_bytes, target_lang=target_lang, report=report)
+    def _num(key: str, default: float | None):
+        value = payload.get(key)
+        if value is None or value == "":
+            return default
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return default
 
-    # En-tête 100 % ASCII (RFC 5987) : un nom de fichier arabe/cyrillique/ accentu\u00e9
-    # ne doit plus provoquer de UnicodeEncodeError -> HTTP 500.
+    align_raw = str(payload.get("align", "right")).lower()
+    valign_raw = str(payload.get("vertical_align", "middle")).lower()
+
+    return StyleOptions(
+        font_id=(payload.get("font_id") or None),
+        font_size=_num("font_size", None),
+        font_size_scale=_num("font_size_scale", 1.0) or 1.0,
+        min_font_size=_num("min_font_size", 5.0) or 5.0,
+        align=(
+            TextAlign(align_raw)
+            if align_raw in TextAlign._value2member_map_
+            else TextAlign.RIGHT
+        ),
+        vertical_align=(
+            VerticalAlign(valign_raw)
+            if valign_raw in VerticalAlign._value2member_map_
+            else VerticalAlign.MIDDLE
+        ),
+        color=str(payload.get("color") or "#14171E"),
+        line_spacing=_num("line_spacing", 1.22) or 1.22,
+        offset_x=_num("offset_x", 0.0) or 0.0,
+        offset_y=_num("offset_y", 0.0) or 0.0,
+        letter_spacing=_num("letter_spacing", 0.0) or 0.0,
+        mask_padding=_num("mask_padding", 0.8) or 0.8,
+    )
+
+
+def _parse_edits(edits_json: str | None) -> dict[str, BlockEdit]:
+    """Désérialise les corrections bloc par bloc (texte, position, taille, masquage)."""
+    if not edits_json:
+        return {}
+    try:
+        payload = json.loads(edits_json)
+    except ValueError as exc:
+        raise InvalidPdfError(
+            "Les corrections de blocs ne sont pas un JSON valide.",
+            status_code=400,
+            code="invalid_edits",
+        ) from exc
+    if not isinstance(payload, list):
+        return {}
+
+    edits: dict[str, BlockEdit] = {}
+    for item in payload:
+        if not isinstance(item, dict) or not item.get("block_id"):
+            continue
+        try:
+            edits[str(item["block_id"])] = BlockEdit(
+                block_id=str(item["block_id"]),
+                text=item.get("text"),
+                x0=float(item["x0"]) if item.get("x0") is not None else None,
+                y0=float(item["y0"]) if item.get("y0") is not None else None,
+                font_size=float(item["font_size"]) if item.get("font_size") else None,
+                hidden=bool(item.get("hidden", False)),
+            )
+        except (TypeError, ValueError):
+            continue
+    return edits
+
+
+def _translated_file_response(
+    content: bytes,
+    filename: str | None,
+    output_format: str,
+    target_lang: TargetLang,
+    report: PipelineReport,
+) -> Response:
+    """Réponse de téléchargement : en-tête ASCII (RFC 5987) + format demandé."""
+    from app.exporters import export as export_name
+
+    media_types = {
+        "pdf": "application/pdf",
+        "png": "image/png",
+        "txt": "text/plain; charset=utf-8",
+        "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    }
     return Response(
-        content=translated_pdf,
-        media_type="application/pdf",
+        content=content,
+        media_type=media_types.get(output_format, "application/octet-stream"),
         headers={
-            "Content-Disposition": build_content_disposition(file.filename, target_lang.value),
+            "Content-Disposition": build_content_disposition(
+                export_name(filename, output_format), target_lang.value
+            ),
             "X-Target-Language": target_lang.value,
-            # Traçabilité : quel moteur a réellement traduit, combien de blocs, etc.
+            "X-Output-Format": output_format,
             **report.headers(),
         },
     )
+
+
+async def _handle_translate_request(
+    file: UploadFile,
+    target_lang: TargetLang,
+    style_json: str | None = None,
+    edits_json: str | None = None,
+    output_format: str = "pdf",
+) -> Response:
+    """Valide l'entrée, applique les options d'édition puis retourne le fichier final."""
+    fmt = (output_format or "pdf").lower()
+    if fmt not in SUPPORTED_OUTPUT_FORMATS:
+        raise InvalidPdfError(
+            f"Format de sortie inconnu : {fmt}.",
+            status_code=415,
+            code="unsupported_output_format",
+            hint="Formats disponibles : " + ", ".join(SUPPORTED_OUTPUT_FORMATS),
+        )
+
+    pdf_bytes, _detected = await _read_upload(file)
+    style = _parse_style(style_json)
+    edits = _parse_edits(edits_json)
+
+    report = PipelineReport()
+    translated_pdf = translate_pdf_bytes(
+        pdf_bytes, target_lang=target_lang, report=report, style=style, edits=edits
+    )
+
+    if fmt == "pdf":
+        content = translated_pdf
+    elif fmt == "png":
+        content = export_pdf_to_png(translated_pdf)
+    else:
+        # Le texte exporté provient de la même source que l'export PDF : extraction
+        # + traduction + corrections, donc TXT/DOCX sont cohérents avec l'aperçu.
+        from app.extractor import extract_pdf_layout
+        from app.pipeline import _apply_edits
+        from app.translation.chain import TranslationChain as _Chain
+
+        _pages = extract_pdf_layout(pdf_bytes)
+        _chain = _Chain()
+        _texts = [b.text for page in _pages for b in page.blocks]
+        _res = _chain.translate_segments(
+            _texts, source=SOURCE_LANG, target=target_lang.value
+        )
+        _cursor = 0
+        _per_page: list[list[tuple[object, str]]] = []
+        for page in _pages:
+            items: list[tuple[object, str]] = []
+            for block in page.blocks:
+                items.append((block, _res.translations[_cursor]))
+                _cursor += 1
+            _per_page.append(items)
+        _per_page = _apply_edits(_per_page, edits)
+        pages_text = [
+            [(block, text) for block, text in page if text] for page in _per_page
+        ]
+        content = (
+            export_text(pages_text)
+            if fmt == "txt"
+            else export_docx(pages_text, target_lang=target_lang.value, style=style)
+        )
+
+    return _translated_file_response(content, file.filename, fmt, target_lang, report)
+
+
+def _pdf_text_by_page(pdf_bytes: bytes) -> list[list[tuple[object, str]]]:
+    """Extrait le texte du PDF produit, page par page, pour les exports TXT/DOCX."""
+    try:
+        from pypdf import PdfReader
+
+        reader = PdfReader(io.BytesIO(pdf_bytes), strict=False)
+        pages: list[list[tuple[object, str]]] = []
+        for page in reader.pages:
+            text = page.extract_text() or ""
+            blocks = [
+                (_SimpleBlock(), line.strip())
+                for line in text.splitlines()
+                if line.strip()
+            ]
+            pages.append(blocks)
+        return pages
+    except Exception:
+        return []
+
+
+class _SimpleBlock:
+    """Bloc minimal pour les exports texte."""
+
+    text = ""
+    font_size = 11.0
 
 
 @app.post(
@@ -143,7 +335,7 @@ async def _handle_translate_request(
 )
 @app.post("/api/translate", include_in_schema=False)
 async def translate_pdf_endpoint(
-    file: Annotated[UploadFile, File(description="Fichier PDF source à traduire")],
+    file: Annotated[UploadFile, File(description="Fichier source : PDF, DOCX, TXT, image")],
     target_lang: Annotated[
         TargetLang | None,
         Form(description="Langue cible ('en', 'fr' ou 'ar')"),
@@ -152,6 +344,18 @@ async def translate_pdf_endpoint(
         TargetLang | None,
         Query(alias="target_lang", description="Langue cible en query param optionnel"),
     ] = None,
+    style: Annotated[
+        str | None,
+        Form(description="Options d'édition JSON (police, taille, alignement, couleur, décalages)"),
+    ] = None,
+    edits: Annotated[
+        str | None,
+        Form(description="Corrections par bloc JSON : [{block_id, text, x0, y0, font_size, hidden}]"),
+    ] = None,
+    output_format: Annotated[
+        str,
+        Form(description="Format de sortie : pdf (défaut), png, txt, docx"),
+    ] = "pdf",
 ) -> Response:
     resolved_lang = target_lang or target_lang_query
     if resolved_lang is None:
@@ -159,7 +363,149 @@ async def translate_pdf_endpoint(
             status_code=422,
             detail="Le paramètre 'target_lang' ('en', 'fr' ou 'ar') est requis.",
         )
-    return await _handle_translate_request(file=file, target_lang=resolved_lang)
+    return await _handle_translate_request(
+        file=file,
+        target_lang=resolved_lang,
+        style_json=style,
+        edits_json=edits,
+        output_format=output_format,
+    )
+
+
+@app.post(
+    "/preview",
+    summary="Préparer l'édition : blocs traduits + aperçu image (sans exporter)",
+)
+@app.post("/api/preview", include_in_schema=False)
+async def preview_endpoint(
+    file: Annotated[UploadFile, File(description="Fichier source : PDF, DOCX, TXT, image")],
+    target_lang: Annotated[TargetLang, Form(description="Langue cible")] = TargetLang.AR,
+    page: Annotated[int, Form(description="Page à prévisualiser (1 = première)")] = 1,
+    max_blocks: Annotated[int, Form(description="Nombre maximal de blocs renvoyés")] = 300,
+    style: Annotated[
+        str | None, Form(description="Options d'édition JSON (aperçu fidèle au rendu final)")
+    ] = None,
+    edits: Annotated[
+        str | None, Form(description="Corrections par bloc JSON")
+    ] = None,
+) -> dict:
+    """Retourne tout ce dont l'éditeur a besoin **avant** l'export :
+
+    - l'aperçu de la page demandée (PNG base64) ;
+    - les blocs traduits avec un identifiant stable, leur texte source, leur
+      traduction, leur position et leur taille de police ;
+    - la liste des polices disponibles et les limites du service.
+
+    Aucun fichier n'est écrit : le client applique ses réglages puis appelle
+    `/translate` avec `style` + `edits` pour obtenir l'export final.
+    """
+    import base64
+
+    pdf_bytes, detected_format = await _read_upload(file)
+    style_options = _parse_style(style)
+    block_edits = _parse_edits(edits)
+
+    report = PipelineReport()
+    translated_pdf = translate_pdf_bytes(
+        pdf_bytes,
+        target_lang=target_lang,
+        report=report,
+        style=style_options,
+        edits=block_edits,
+    )
+
+    # Rendu de la page demandée pour l'aperçu visuel
+    preview_png: str | None = None
+    try:
+        import pymupdf
+
+        document = pymupdf.open(stream=translated_pdf, filetype="pdf")
+        index = max(0, min(page - 1, document.page_count - 1))
+        pixmap = document[index].get_pixmap(dpi=110)
+        preview_png = base64.b64encode(pixmap.tobytes("png")).decode("ascii")
+        page_count = document.page_count
+        page_sizes = [
+            {"width": round(p.rect.width, 2), "height": round(p.rect.height, 2)}
+            for p in document
+        ]
+    except Exception:  # pragma: no cover - aperçu optionnel
+        page_count = report.pages
+        page_sizes = []
+
+    # Blocs extraits (source + traduction) pour l'édition fine
+    from app.extractor import extract_pdf_layout
+    from app.pipeline import _apply_edits  # noqa: PLC0415
+    from app.schemas import block_id_of
+    from app.translation.chain import TranslationChain
+
+    pages = extract_pdf_layout(pdf_bytes)
+    chain = TranslationChain()
+    blocks_payload: list[dict] = []
+    per_page: list[list[tuple]] = []
+
+    for page_index, extracted in enumerate(pages):
+        texts = [block.text for block in extracted.blocks]
+        result = chain.translate_segments(texts, source=SOURCE_LANG, target=target_lang.value)
+        items = list(zip(extracted.blocks, result.translations, strict=False))
+        per_page.append(items)
+        if page_index != page - 1:  # `page` est numérotée à partir de 1
+            continue
+        for position, (block, translated) in enumerate(items):
+            source_text = block.text.strip()
+            if not source_text:
+                continue
+            # Tous les blocs sont éditables (texte, position, taille) : l'utilisateur
+            # peut corriger une traduction ou repositionner un code conservé.
+            unchanged = source_text == (translated or "").strip()
+            blocks_payload.append(
+                {
+                    "block_id": block_id_of(block, page_index, position),
+                    "text": block.text,
+                    "translation": translated,
+                    "unchanged": unchanged,
+                    "bbox": [round(v, 2) for v in block.bbox],
+                    "font_size": block.font_size,
+                    "line_count": block.line_count,
+                }
+            )
+            if len(blocks_payload) >= max_blocks:
+                break
+
+    return {
+        "status": "ok",
+        "input_format": detected_format,
+        "target_lang": target_lang.value,
+        "page": page,
+        "page_count": page_count,
+        "page_sizes": page_sizes,
+        "preview_png_base64": preview_png,
+        "blocks": blocks_payload,
+        "block_total": sum(len(b) for b in per_page) if per_page else 0,
+        "fonts": font_catalog(),
+        "output_formats": SUPPORTED_OUTPUT_FORMATS,
+        "input_formats": SUPPORTED_INPUT_FORMATS,
+        "translation": {
+            "provider": report.provider,
+            "degraded": report.degraded,
+            "warnings": report.warnings,
+        },
+        "limits": {"max_upload_mb": MAX_UPLOAD_MB, "max_pages": MAX_PAGES},
+    }
+
+
+@app.get("/fonts", summary="Catalogue des polices disponibles pour l'éditeur")
+@app.get("/api/fonts", include_in_schema=False)
+def fonts_endpoint() -> dict:
+    return {"fonts": font_catalog()}
+
+
+@app.get("/formats", summary="Formats d'entrée et de sortie pris en charge")
+@app.get("/api/formats", include_in_schema=False)
+def formats_endpoint() -> dict:
+    return {
+        "input": SUPPORTED_INPUT_FORMATS,
+        "output": SUPPORTED_OUTPUT_FORMATS,
+    }
 
 
 @app.post(
@@ -171,13 +517,7 @@ async def inspect_extraction_endpoint(
     file: Annotated[UploadFile, File(description="Fichier PDF à analyser")],
     target_lang: Annotated[TargetLang, Form(description="Langue cible")] = TargetLang.AR,
 ) -> dict:
-    pdf_bytes = await file.read()
-    if not pdf_bytes or not pdf_bytes.lstrip().startswith(b"%PDF-"):
-        raise InvalidPdfError("Fichier PDF invalide.")
-    if len(pdf_bytes) > MAX_UPLOAD_BYTES:
-        raise PayloadTooLargeError(
-            f"Le fichier dépasse la taille maximale autorisée ({MAX_UPLOAD_MB} Mo)."
-        )
+    pdf_bytes, _detected = await _read_upload(file)
 
     pages = extract_pdf_layout(pdf_bytes)
     return {
@@ -296,6 +636,37 @@ def _dependency_versions() -> dict[str, str]:
         except Exception as exc:  # pragma: no cover - dépend de l'environnement
             versions[package_name] = f"ERREUR D'IMPORT: {type(exc).__name__}: {exc}"
     return versions
+
+
+@app.get("/editor", response_class=HTMLResponse, include_in_schema=False)
+@app.get("/api/editor", response_class=HTMLResponse, include_in_schema=False)
+def editor_page() -> HTMLResponse:
+    """Éditeur : réglage police / taille / position / corrections avant export."""
+    path = PROJECT_ROOT / "static" / "editor.html"
+    if not path.is_file():
+        raise InvalidPdfError(
+            "L'éditeur n'est pas présent dans ce déploiement (static/editor.html manquant).",
+            status_code=503,
+            code="editor_missing",
+        )
+    return HTMLResponse(content=path.read_text(encoding="utf-8"))
+
+
+@app.get("/editor.js", include_in_schema=False)
+@app.get("/api/editor.js", include_in_schema=False)
+def editor_script() -> Response:
+    path = PROJECT_ROOT / "static" / "editor.js"
+    if not path.is_file():
+        raise InvalidPdfError(
+            "Script de l'éditeur manquant dans ce déploiement.",
+            status_code=503,
+            code="editor_missing",
+        )
+    return Response(
+        content=path.read_text(encoding="utf-8"),
+        media_type="application/javascript; charset=utf-8",
+        headers={"Cache-Control": "no-cache"},
+    )
 
 
 @app.get("/", response_class=HTMLResponse, include_in_schema=False)
@@ -465,6 +836,7 @@ def interactive_console() -> HTMLResponse:
       </div>
       <div class="badges">
         <span class="badge">EN / FR / AR (RTL)</span>
+        <a class="badge" href="./editor">✎ Éditeur avant export</a>
         <a class="badge" href="./docs" target="_blank">OpenAPI /docs &nearr;</a>
       </div>
     </header>

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import io
 import logging
 import re
 import time
@@ -12,7 +13,7 @@ from app.config import SOURCE_LANG, TRANSLATE_ENABLED, TRANSLATE_TIME_BUDGET_S
 from app.errors import PdfProcessingError, PdfServiceError
 from app.extractor import extract_pdf_layout
 from app.renderer import build_overlay_pdf, merge_overlay_with_original
-from app.schemas import ExtractedPage, TargetLang, TextBlock
+from app.schemas import BlockEdit, ExtractedPage, StyleOptions, TargetLang, TextBlock
 from app.translation.chain import TranslationChain, TranslationResult
 
 logger = logging.getLogger(__name__)
@@ -78,11 +79,78 @@ def _translate_pages(
     return per_page, result, timed_out
 
 
+def _original_page_boxes(pdf_bytes: bytes) -> list[tuple[float, float]]:
+    """Dimensions réelles (cropbox, rotation) des pages du PDF d'origine.
+
+    L'aperçu de l'éditeur utilise ces valeurs : sans elles, une page en paysage ou
+    avec une cropbox décalée verrait son texte décalé à l'export.
+    """
+    try:
+        from pypdf import PdfReader
+
+        reader = PdfReader(io.BytesIO(pdf_bytes), strict=False)
+        boxes: list[tuple[float, float]] = []
+        for page in reader.pages:
+            try:
+                box = page.cropbox or page.mediabox
+                boxes.append((float(box.width), float(box.height)))
+            except Exception:
+                boxes.append((0.0, 0.0))
+        return boxes
+    except Exception:
+        return []
+
+
+def _apply_edits(
+    per_page: list[list[tuple[TextBlock, str]]],
+    edits: dict[str, BlockEdit] | None,
+) -> list[list[tuple[TextBlock, str]]]:
+    """Reconstruit les couples (bloc, texte) avec les corrections de l'utilisateur.
+
+    L'aperçu HTML et l'export PDF passent tous les deux par ici : ce que l'utilisateur
+    voit dans l'éditeur est exactement ce qu'il obtient dans le fichier final.
+    """
+    if not edits:
+        return per_page
+
+    from app.schemas import block_id_of
+
+    rebuilt: list[list[tuple[TextBlock, str]]] = []
+    for page_index, page_items in enumerate(per_page):
+        page_out: list[tuple[TextBlock, str]] = []
+        for position, (block, translated) in enumerate(page_items):
+            edit = edits.get(block_id_of(block, page_index, position))
+            if edit is None:
+                page_out.append((block, translated))
+                continue
+            if edit.hidden:
+                page_out.append((block, ""))
+                continue
+            text = edit.text if edit.text is not None else translated
+            dx = (edit.x0 - block.x0) if edit.x0 is not None else 0.0
+            dy = (edit.y0 - block.y0) if edit.y0 is not None else 0.0
+            moved = TextBlock(
+                text=block.text,
+                x0=block.x0 + dx,
+                y0=block.y0 + dy,
+                x1=block.x1 + dx,
+                y1=block.y1 + dy,
+                font_size=edit.font_size or block.font_size,
+                line_count=block.line_count,
+                baseline_y=(block.baseline_y + dy) if block.baseline_y is not None else None,
+            )
+            page_out.append((moved, text))
+        rebuilt.append(page_out)
+    return rebuilt
+
+
 def translate_pdf_bytes(
     pdf_bytes: bytes,
     target_lang: TargetLang | str,
     *,
     report: PipelineReport | None = None,
+    style: StyleOptions | None = None,
+    edits: dict[str, BlockEdit] | None = None,
 ) -> bytes:
     """Exécute le pipeline complet et retourne le PDF traduit.
 
@@ -160,11 +228,17 @@ def translate_pdf_bytes(
                 "(aucune fausse traduction n'a été insérée)."
             )
 
+    per_page = _apply_edits(per_page, edits)
+
     try:
         overlay_bytes = build_overlay_pdf(
             pages=pages,
             translated_blocks_per_page=per_page,
             target_lang=lang,
+            mask_padding=(style.mask_padding if style else 0.8),
+            style=style,
+            edits=edits,
+            page_boxes=_original_page_boxes(pdf_bytes),
         )
         output = merge_overlay_with_original(pdf_bytes, overlay_bytes)
     except PdfServiceError:

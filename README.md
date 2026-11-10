@@ -158,3 +158,50 @@ Les points d'entrée gratuits ne sont pas contractuels : Google peut limiter l'u
 et MyMemory plafonne à quelques milliers de caractères par jour. Pour un usage régulier ou
 professionnel, **auto-hébergez LibreTranslate** (gratuit, illimité, qualité correcte) et
 pointez `LIBRETRANSLATE_URL` dessus.
+
+---
+
+## Éditeur avant export (police, taille, position, corrections)
+
+Ouvrez **`/editor`** (lien « ✎ Éditeur avant export » depuis la page d'accueil).
+
+1. Importez un fichier (PDF, DOCX, TXT/Markdown, image PNG/JPG/WEBP).
+2. Cliquez sur **« Préparer l'aperçu »** : la page est rendue en image et chaque
+   bloc de texte est listé avec sa traduction.
+3. Réglez ce que vous voulez :
+   - **Police** : Amiri, Noto Naskh Arabic, Noto Sans Arabic, IBM Plex Sans Arabic,
+     DejaVu Sans (multi-script), Roboto / Open Sans / Lato (latin) ;
+   - **Taille** : automatique (taille d'origine), imposée en points, ou échelle en % ;
+   - **Alignement** : horizontal (droite/centre/gauche) et vertical (haut/milieu/bas) ;
+   - **Couleur**, **interligne**, **décalage global** X/Y en points ;
+   - **Correction bloc par bloc** : nouveau texte, taille, déplacement, masquage.
+4. Choisissez le **format de sortie** puis cliquez sur **« Exporter le document »**.
+
+L'aperçu et l'export passent par le **même code** (`/preview` et `/translate`
+partagent le rendu) : ce que vous voyez est ce que vous obtenez.
+
+### Formats
+
+| Entrée | Sortie |
+| --- | --- |
+| PDF (vectoriel) | PDF (mise en page préservée) |
+| Word `.docx` | Word `.docx` |
+| TXT / Markdown / CSV | Texte `.txt` |
+| Image PNG / JPG / WEBP (OCR si `pytesseract` installé) | Image `.png` |
+
+### API correspondante
+
+```bash
+# 1) Préparer l'édition (blocs + aperçu PNG base64)
+curl -X POST http://localhost:8000/preview \
+  -F "file=@facture.pdf" -F "target_lang=ar" -F "page=1"
+
+# 2) Exporter avec le style et les corrections
+curl -X POST http://localhost:8000/translate \
+  -F "file=@facture.pdf" -F "target_lang=ar" \
+  -F 'style={"font_id":"noto-naskh","font_size":12,"align":"center","color":"#B3121B","offset_x":4}' \
+  -F 'edits=[{"block_id":"p0-b3-100.0_700.0_200.0_720.0","text":"Texte corrigé","x0":110,"font_size":13}]' \
+  -F "output_format=docx" --output facture_ar.docx
+```
+
+Polices proposées par `GET /api/fonts`, formats supportés par `GET /api/formats`.

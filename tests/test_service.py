@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import io
+import json
+
 from fastapi.testclient import TestClient
 from pypdf import PdfReader
 
@@ -388,3 +390,207 @@ def test_real_pdf_translation_keeps_layout_masks_only_translated_blocks(monkeypa
     # Aucun texte de remplissage du faux traducteur
     fillers = ("نص مترجم", "\uFEE1\uFEE8\uFE8E \uFEA9\uFEF2\uFEB3\uFEE2")
     assert not any(filler in text for filler in fillers)
+
+
+# ---------------------------------------------------------------------------
+# Éditeur avant export : police, taille, alignement, position, corrections
+# et formats d'entrée/sortie.
+# ---------------------------------------------------------------------------
+
+
+from app.fonts import font_catalog, get_font_family  # noqa: E402
+from app.schemas import BlockEdit, StyleOptions, TextAlign, VerticalAlign  # noqa: E402
+
+
+def test_font_catalog_only_lists_verified_fonts() -> None:
+    """Les polices Google cassant les ligatures arabes ne doivent pas être proposées."""
+    ids = {font["id"] for font in font_catalog()}
+    assert {"amiri", "noto-naskh", "noto-sans-arabic", "ibm-plex-arabic", "roboto"} <= ids
+    # Vérifiées comme défectueuses sur les Presentation Forms arabes :
+    assert not ({"cairo", "tajawal", "almarai", "readex-pro"} & ids)
+
+
+def test_latin_font_is_replaced_by_arabic_font_for_arabic() -> None:
+    assert get_font_family("roboto", is_arabic=True).id == "amiri"
+    assert get_font_family("roboto", is_arabic=False).id == "roboto"
+    assert get_font_family("inconnue", is_arabic=True).id == "amiri"
+
+
+def test_style_changes_embedded_font() -> None:
+    """Choisir une autre police doit réellement changer la police embarquée."""
+    pdf = generate_sample_pdf()
+    out = client.post(
+        "/translate",
+        files={"file": ("a.pdf", pdf, "application/pdf")},
+        data={"target_lang": "ar", "style": '{"font_id": "noto-sans-arabic"}'},
+    )
+    assert out.status_code == 200
+    reader = PdfReader(io.BytesIO(out.content))
+    fonts = reader.pages[0].get("/Resources", {}).get("/Font", {})
+    names = [str(f.get_object().get("/BaseFont", "")) for f in fonts.values()]
+    assert any("NotoSansArabic" in name for name in names), names
+
+
+def test_style_size_and_color_are_applied() -> None:
+    pdf = generate_sample_pdf()
+    style = (
+        '{"font_size": 16, "align": "center", "vertical_align": "top",'
+        ' "color": "#B3121B", "offset_x": 4, "offset_y": 3, "line_spacing": 1.3}'
+    )
+    out = client.post(
+        "/translate",
+        files={"file": ("a.pdf", pdf, "application/pdf")},
+        data={"target_lang": "ar", "style": style},
+    )
+    assert out.status_code == 200
+    assert out.content.startswith(b"%PDF-")
+
+
+def test_invalid_style_json_returns_400() -> None:
+    out = client.post(
+        "/translate",
+        files={"file": ("a.pdf", generate_sample_pdf(), "application/pdf")},
+        data={"target_lang": "ar", "style": "{pas du json"},
+    )
+    assert out.status_code == 400
+    assert out.json()["detail"]["code"] == "invalid_style"
+
+
+def test_preview_returns_editable_blocks_and_fonts() -> None:
+    out = client.post(
+        "/preview",
+        files={"file": ("a.pdf", generate_sample_pdf(), "application/pdf")},
+        data={"target_lang": "ar", "page": "1"},
+    )
+    assert out.status_code == 200
+    payload = out.json()
+    assert payload["status"] == "ok"
+    assert payload["page"] == 1 and payload["page_count"] >= 1
+    assert payload["blocks"], "aucun bloc éditable renvoyé"
+    first = payload["blocks"][0]
+    assert {"block_id", "text", "translation", "bbox", "font_size"} <= set(first)
+    assert payload["fonts"] and payload["output_formats"]
+    assert payload["preview_png_base64"]
+
+
+def test_block_edit_replaces_text_and_position() -> None:
+    preview = client.post(
+        "/preview",
+        files={"file": ("a.pdf", generate_sample_pdf(), "application/pdf")},
+        data={"target_lang": "ar"},
+    ).json()
+    block = preview["blocks"][0]
+    edits = json.dumps(
+        [
+            {
+                "block_id": block["block_id"],
+                "text": "CORRECTION MANUELLE",
+                "x0": block["bbox"][0] + 12,
+                "font_size": 14,
+            }
+        ]
+    )
+    out = client.post(
+        "/translate",
+        files={"file": ("a.pdf", generate_sample_pdf(), "application/pdf")},
+        data={"target_lang": "ar", "edits": edits},
+    )
+    assert out.status_code == 200
+    text = PdfReader(io.BytesIO(out.content)).pages[0].extract_text()
+    assert "CORRECTION MANUELLE" in text
+
+
+def test_hidden_block_is_removed_for_ar() -> None:
+    preview = client.post(
+        "/preview",
+        files={"file": ("a.pdf", generate_sample_pdf(), "application/pdf")},
+        data={"target_lang": "ar"},
+    ).json()
+    block = preview["blocks"][0]
+    edits = json.dumps([{"block_id": block["block_id"], "hidden": True}])
+    out = client.post(
+        "/translate",
+        files={"file": ("a.pdf", generate_sample_pdf(), "application/pdf")},
+        data={"target_lang": "ar", "edits": edits},
+    )
+    assert out.status_code == 200
+
+
+@pytest.mark.parametrize("fmt", ["pdf", "png", "txt", "docx"])
+def test_output_formats(fmt: str) -> None:
+    out = client.post(
+        "/translate",
+        files={"file": ("a.pdf", generate_sample_pdf(), "application/pdf")},
+        data={"target_lang": "ar", "output_format": fmt},
+    )
+    assert out.status_code == 200
+    assert out.headers["x-output-format"] == fmt
+    assert len(out.content) > 20
+    if fmt == "pdf":
+        assert out.content.startswith(b"%PDF-")
+    if fmt == "png":
+        assert out.content.startswith(b"\x89PNG")
+    if fmt == "txt":
+        assert "Page 1" in out.content.decode("utf-8")
+
+
+def test_unsupported_output_format_returns_415() -> None:
+    out = client.post(
+        "/translate",
+        files={"file": ("a.pdf", generate_sample_pdf(), "application/pdf")},
+        data={"target_lang": "ar", "output_format": "xlsx"},
+    )
+    assert out.status_code == 415
+    assert out.json()["detail"]["code"] == "unsupported_output_format"
+
+
+def test_txt_input_and_docx_input_are_converted() -> None:
+    txt = "Port of Loading\n\nGross Weight : 4960,000 kgs\n".encode()
+    out = client.post("/translate", files={"file": ("notes.txt", txt, "text/plain")}, data={"target_lang": "ar"})
+    assert out.status_code == 200
+    assert out.content.startswith(b"%PDF-")
+
+    import docx
+
+    document = docx.Document()
+    document.add_heading("Commercial Invoice", 1)
+    document.add_paragraph("Bill To: ASSADAKA GROUP")
+    buffer = io.BytesIO()
+    document.save(buffer)
+
+    out = client.post(
+        "/translate",
+        files={
+            "file": (
+                "facture.docx",
+                buffer.getvalue(),
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            )
+        },
+        data={"target_lang": "ar"},
+    )
+    assert out.status_code == 200
+    assert out.content.startswith(b"%PDF-")
+
+
+def test_editor_page_and_script_are_served() -> None:
+    page = client.get("/editor")
+    assert page.status_code == 200
+    assert "Éditeur" in page.text
+    script = client.get("/editor.js")
+    assert script.status_code == 200
+    assert "exportBtn" in script.text
+
+
+def test_formats_endpoint_lists_supported_types() -> None:
+    payload = client.get("/formats").json()
+    assert "pdf" in payload["input"] and "docx" in payload["input"]
+    assert set(payload["output"]) == {"pdf", "png", "txt", "docx"}
+
+
+def test_style_options_helpers() -> None:
+    style = StyleOptions(font_size=12, font_size_scale=1.5, align=TextAlign.CENTER)
+    assert style.resolved_font_size(8) == 18  # taille imposée × échelle
+    assert StyleOptions().resolved_font_size(10) == 10  # taille détectée
+    assert BlockEdit(block_id="x", text="y").hidden is False
+    assert VerticalAlign.MIDDLE.value == "middle"
