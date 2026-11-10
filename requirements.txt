@@ -1,8 +1,11 @@
-fastapi>=0.115.0
-uvicorn[standard]>=0.30.0
-python-multipart>=0.0.9
-pdfminer.six>=20231228
-arabic-reshaper>=3.0.0
-python-bidi>=0.4.2
-reportlab>=4.1.0
-pypdf>=4.2.0
+# Versions épinglées : évite les régressions silencieuses lors des déploiements
+# (une montée de version majeure de python-bidi/pypdf/reportlab peut casser
+#  l'import ou l'API utilisée -> erreur 500 au runtime).
+fastapi==0.117.1
+uvicorn[standard]==0.37.0
+python-multipart==0.0.20
+pdfminer.six==20250506
+arabic-reshaper==3.0.0
+python-bidi==0.6.6
+reportlab==4.4.4
+pypdf==6.1.1

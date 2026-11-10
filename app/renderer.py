@@ -10,11 +10,27 @@ from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfgen import canvas
 
 from app.arabic_utils import format_arabic_text, reshape_arabic
+from app.config import PROJECT_ROOT
+from app.errors import FontUnavailableError
 from app.schemas import ExtractedPage, TargetLang, TextBlock
 
 ASSETS_FONTS_DIR = Path(__file__).resolve().parent.parent / "assets" / "fonts"
 AMIRI_FONT_PATH = ASSETS_FONTS_DIR / "Amiri-Regular.ttf"
 LATIN_FONT_PATH = ASSETS_FONTS_DIR / "DejaVuSans.ttf"
+
+# Chemins de repli : selon le mode de bundling serverless, le répertoire de
+# travail peut être la racine du projet ou /var/task.
+_FALLBACK_FONT_DIRS = (
+    PROJECT_ROOT / "assets" / "fonts",
+    Path.cwd() / "assets" / "fonts",
+    Path("/var/task/assets/fonts"),
+    Path("/var/task/user/assets/fonts"),
+)
+
+_FALLBACK_LATIN_FONTS = (
+    Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
+    Path("/usr/share/fonts/dejavu/DejaVuSans.ttf"),
+)
 
 ARABIC_FONT_NAME = "Amiri"
 LATIN_FONT_NAME = "DejaVuSans"
@@ -22,25 +38,76 @@ LATIN_FONT_NAME = "DejaVuSans"
 _FONTS_REGISTERED = False
 
 
+def _resolve_font_path(filename: str) -> Path | None:
+    """Cherche un TTF dans assets/fonts puis dans les emplacements de repli serverless."""
+    candidates = [ASSETS_FONTS_DIR / filename, *(d / filename for d in _FALLBACK_FONT_DIRS)]
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def fonts_diagnostics() -> dict[str, object]:
+    """État des polices TTF : utile pour diagnostiquer un 500 en production (`/api/diag`)."""
+    amiri = _resolve_font_path(AMIRI_FONT_PATH.name)
+    latin = _resolve_font_path(LATIN_FONT_PATH.name) or next(
+        (p for p in _FALLBACK_LATIN_FONTS if p.is_file()), None
+    )
+    return {
+        "project_root": str(PROJECT_ROOT),
+        "cwd": str(Path.cwd()),
+        "assets_fonts_dir": str(ASSETS_FONTS_DIR),
+        "assets_fonts_dir_exists": ASSETS_FONTS_DIR.is_dir(),
+        "amiri": {
+            "expected": str(AMIRI_FONT_PATH),
+            "found": str(amiri) if amiri else None,
+            "ok": amiri is not None,
+        },
+        "latin": {
+            "expected": str(LATIN_FONT_PATH),
+            "found": str(latin) if latin else None,
+            "ok": latin is not None,
+        },
+        "registered": _FONTS_REGISTERED,
+    }
+
+
 def ensure_fonts_registered() -> None:
-    """Enregistre les polices TTF Unicode (`Amiri` pour l'arabe, `DejaVuSans` pour en/fr)."""
+    """Enregistre les polices TTF Unicode (`Amiri` pour l'arabe, `DejaVuSans` pour en/fr).
+
+    Lève `FontUnavailableError` (HTTP 503 + message explicite) si le bundle déployé
+    ne contient pas les polices, au lieu d'une `FileNotFoundError` transformée en 500.
+    """
     global _FONTS_REGISTERED
     if _FONTS_REGISTERED:
         return
 
-    if not AMIRI_FONT_PATH.is_file():
-        raise FileNotFoundError(
-            f"Police TTF arabe introuvable : {AMIRI_FONT_PATH}. "
-            "Assurez-vous que Amiri-Regular.ttf est présente dans assets/fonts/."
-        )
-    pdfmetrics.registerFont(TTFont(ARABIC_FONT_NAME, str(AMIRI_FONT_PATH)))
+    registered = set(pdfmetrics.getRegisteredFontNames())
 
-    if LATIN_FONT_PATH.is_file():
-        pdfmetrics.registerFont(TTFont(LATIN_FONT_NAME, str(LATIN_FONT_PATH)))
-    elif Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf").is_file():
-        pdfmetrics.registerFont(
-            TTFont(LATIN_FONT_NAME, "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf")
+    amiri_path = _resolve_font_path(AMIRI_FONT_PATH.name)
+    if amiri_path is None:
+        diag = fonts_diagnostics()
+        raise FontUnavailableError(
+            "Police TTF arabe 'Amiri-Regular.ttf' introuvable dans le bundle déployé.",
+            hint=(
+                "Chemin attendu : "
+                f"{diag['amiri']['expected']}. Cause la plus fréquente sur Vercel : "
+                "les polices ne sont pas incluses dans le bundle de la fonction. "
+                "Ajoutez la section 'includeFiles' de vercel.json (assets/**) "
+                "ou placez les polices dans un dossier importé par l'application."
+            ),
         )
+    if ARABIC_FONT_NAME not in registered:
+        pdfmetrics.registerFont(TTFont(ARABIC_FONT_NAME, str(amiri_path)))
+
+    latin_path = _resolve_font_path(LATIN_FONT_PATH.name) or next(
+        (p for p in _FALLBACK_LATIN_FONTS if p.is_file()), None
+    )
+    if latin_path is not None and LATIN_FONT_NAME not in registered:
+        try:
+            pdfmetrics.registerFont(TTFont(LATIN_FONT_NAME, str(latin_path)))
+        except Exception:  # pragma: no cover - police de repli optionnelle
+            pass
 
     _FONTS_REGISTERED = True
 
