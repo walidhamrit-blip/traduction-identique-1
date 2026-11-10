@@ -268,3 +268,123 @@ def test_safe_ascii_stem_fallbacks() -> None:
     assert safe_ascii_stem(None) == "document"
     assert safe_ascii_stem("../../etc/passwd.pdf") == "passwd"
     assert len(safe_ascii_stem("a" * 500 + ".pdf")) <= 80
+
+
+# ---------------------------------------------------------------------------
+# Chaîne de traduction gratuite : fournisseurs factices (aucun réseau en test).
+# ---------------------------------------------------------------------------
+
+
+from app.translation.chain import TranslationChain, clear_cache  # noqa: E402
+from app.translation.providers import (  # noqa: E402
+    ProviderUnavailable,
+    TranslationProvider,
+)
+from app.translation.sanitizer import is_untranslatable, split_long_segment  # noqa: E402
+
+
+class FakeProvider(TranslationProvider):
+    name = "fake"
+
+    def __init__(self, mapping: dict[str, str] | None = None, fail: bool = False) -> None:
+        self.mapping = mapping or {}
+        self.fail = fail
+        self.seen: list[str] = []
+
+    def translate_batch(self, texts, source="auto", target="ar"):
+        if self.fail:
+            raise ProviderUnavailable("service coupé")
+        self.seen.extend(texts)
+        return [self.mapping.get(t, f"AR:{t}") for t in texts]
+
+
+def test_codes_and_references_are_never_translated() -> None:
+    """Les codes conteneurs, références et artefacts web restent intacts."""
+    for segment in (
+        "I000503614",
+        "CAAU2973244 20DC",
+        "info@ais.ly",
+        "+218 91 616 2121",
+        "3/4/1/2",
+        "4960,000",
+        "www.ais.ly",
+        "function(e){return e}",
+        "4922,20,00,00,19",
+    ):
+        assert is_untranslatable(segment), segment
+
+    # Le vrai texte doit au contraire être traduit
+    for segment in ("Port of Loading", "Gross Weight", "Standard Conditions (1997)"):
+        assert not is_untranslatable(segment), segment
+
+
+def test_chain_translates_only_translatable_segments() -> None:
+    clear_cache()
+    provider = FakeProvider({"Port of Loading": "ميناء الشحن"})
+    chain = TranslationChain(providers=[provider])
+
+    texts = ["Port of Loading", "CAAU2973244 20DC", "Gross Weight"]
+    result = chain.translate_segments(texts, source="en", target="ar")
+
+    assert result.translations == ["ميناء الشحن", "CAAU2973244 20DC", "AR:Gross Weight"]
+    assert provider.seen == ["Port of Loading", "Gross Weight"]
+    assert result.skipped_count == 1
+    assert result.provider == "fake"
+
+
+def test_chain_deduplicates_repeated_labels() -> None:
+    """Un libellé répété 30 fois ne doit être envoyé qu'une seule fois au moteur."""
+    clear_cache()
+    provider = FakeProvider()
+    chain = TranslationChain(providers=[provider])
+
+    texts = ["Gross Weight"] * 30 + ["Port of Loading"] * 5
+    chain.translate_segments(texts, source="en", target="ar")
+
+    assert provider.seen.count("Gross Weight") == 1
+    assert provider.seen.count("Port of Loading") == 1
+
+
+def test_chain_falls_back_honestly_when_all_providers_fail() -> None:
+    """Aucun fournisseur joignable : le texte d'origine est conservé, rien n'est inventé."""
+    clear_cache()
+    chain = TranslationChain(providers=[FakeProvider(fail=True)])
+    result = chain.translate_segments(["Port of Loading"], source="en", target="ar")
+
+    assert result.provider == "offline"
+    assert result.translations == ["Port of Loading"]  # pas de faux texte arabe
+    assert result.degraded is True
+
+
+def test_long_segments_are_split_without_losing_content() -> None:
+    paragraph = ("The Freight Forwarder shall be liable. " * 120).strip()
+    pieces = split_long_segment(paragraph, max_chars=500)
+    assert len(pieces) > 1
+    assert all(len(piece) <= 500 for piece in pieces)
+    assert "Freight Forwarder" in " ".join(pieces)
+
+
+def test_real_pdf_translation_keeps_layout_masks_only_translated_blocks(monkeypatch) -> None:
+    """Le PDF traduit ne doit jamais contenir de texte de remplissage inventé."""
+    clear_cache()
+    from app import pipeline as pipeline_module
+
+    class StubChain:
+        def translate_segments(self, texts, source, target):
+            from app.translation.chain import TranslationResult
+
+            result = TranslationResult()
+            result.provider = "stub"
+            result.translations = [f"ترجمة {t}" for t in texts]
+            result.translated_count = len(texts)
+            return result
+
+    monkeypatch.setattr(pipeline_module, "TranslationChain", StubChain)
+    output = pipeline_module.translate_pdf_bytes(generate_sample_pdf(), "ar")
+    text = PdfReader(io.BytesIO(output)).pages[0].extract_text()
+    # Le texte est reshapé en formes de présentation arabes (U+FB50..U+FEFF)
+    has_arabic = any("\uFB50" <= ch <= "\uFEFF" or "\u0600" <= ch <= "\u06FF" for ch in text)
+    assert has_arabic
+    # Aucun texte de remplissage du faux traducteur
+    fillers = ("نص مترجم", "\uFEE1\uFEE8\uFE8E \uFEA9\uFEF2\uFEB3\uFEE2")
+    assert not any(filler in text for filler in fillers)

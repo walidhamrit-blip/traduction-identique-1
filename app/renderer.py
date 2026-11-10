@@ -215,11 +215,24 @@ def build_overlay_pdf(
     mask_padding: float = 0.8,
 ) -> bytes:
     """Construit avec `reportlab` un PDF calque contenant :
-    1. Un rectangle blanc opaque aux coordonnées exactes `(x0, y0, x1, y1)` de chaque bloc.
+    1. Un rectangle blanc opaque aux coordonnées exactes `(x0, y0, x1, y1)` de chaque bloc
+       **uniquement si le texte a réellement été traduit**.
     2. Le texte traduit positionné par-dessus (aligné à droite en RTL avec `Amiri` si `ar`).
+
+    Les blocs non traduits (codes, références, artefacts web) ne sont ni masqués ni
+    réécrits : le texte d'origine reste visible, la mise en page est préservée.
     """
     font_name = _select_font_name(target_lang)
     is_arabic = target_lang == TargetLang.AR
+
+    def _needs_replacement(block: TextBlock, translated_text: str) -> bool:
+        """Faut-il masquer l'original et écrire la traduction ?"""
+        if not translated_text or not translated_text.strip():
+            return False
+        original = " ".join(block.text.split())
+        candidate = " ".join(translated_text.split())
+        # Identique (ou casse/typographie seule) -> le texte source reste en place
+        return candidate.casefold() != original.casefold()
 
     buffer = io.BytesIO()
     c = canvas.Canvas(buffer)
@@ -232,7 +245,7 @@ def build_overlay_pdf(
         c.setFillColorRGB(1.0, 1.0, 1.0)
         c.setStrokeColorRGB(1.0, 1.0, 1.0)
         for block, translated_text in page_items:
-            if not translated_text:
+            if not _needs_replacement(block, translated_text):
                 continue
             rx0 = max(0.0, block.x0 - mask_padding)
             ry0 = max(0.0, block.y0 - mask_padding)
@@ -245,7 +258,7 @@ def build_overlay_pdf(
         c.saveState()
         c.setFillColorRGB(0.08, 0.09, 0.12)
         for block, translated_text in page_items:
-            if not translated_text:
+            if not _needs_replacement(block, translated_text):
                 continue
 
             logical_lines, font_size, line_height = _fit_text_in_bbox(
@@ -254,11 +267,16 @@ def build_overlay_pdf(
             c.setFont(font_name, font_size)
 
             if len(logical_lines) == 1:
-                # Centrage vertical précis de la ligne de base dans [y0, y1]
-                # Cap-height visuel moyen ~ 0.72 * font_size, descente ~ 0.20 * font_size
-                baseline_y = block.y0 + max(
-                    font_size * 0.18, (block.height - font_size * 0.54) / 2.0
-                )
+                # Priorité à la ligne de base réelle du texte source (évite tout décalage
+                # vertical) ; sinon centrage dans la Bounding Box.
+                if block.baseline_y is not None:
+                    baseline_y = block.baseline_y - font_size * 0.06
+                else:
+                    baseline_y = block.y0 + max(
+                        font_size * 0.18, (block.height - font_size * 0.54) / 2.0
+                    )
+                # Ne jamais sortir de la zone d'origine (bas du bloc)
+                baseline_y = max(baseline_y, block.y0 + font_size * 0.12)
                 line_text = (
                     format_arabic_text(logical_lines[0])
                     if is_arabic

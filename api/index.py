@@ -22,6 +22,8 @@ from app.config import (
     MAX_UPLOAD_MB,
     PROJECT_ROOT,
     SERVICE_VERSION,
+    SOURCE_LANG,
+    TRANSLATE_ENABLED,
 )
 from app.errors import (
     EmptyPdfError,
@@ -31,7 +33,8 @@ from app.errors import (
 )
 from app.extractor import extract_pdf_layout
 from app.filenames import build_content_disposition
-from app.pipeline import translate_pdf_bytes
+from app.pipeline import PipelineReport, translate_pdf_bytes
+from app.translation.chain import chain_diagnostics, provider_order
 from app.renderer import ensure_fonts_registered, fonts_diagnostics
 from app.sample_generator import generate_sample_pdf
 from app.schemas import TargetLang
@@ -110,7 +113,8 @@ async def _handle_translate_request(
 
     # `translate_pdf_bytes` lève des `PdfServiceError` typées (400/413/422/503),
     # interceptées par le gestionnaire global : plus aucun 500 opaque.
-    translated_pdf = translate_pdf_bytes(pdf_bytes, target_lang=target_lang)
+    report = PipelineReport()
+    translated_pdf = translate_pdf_bytes(pdf_bytes, target_lang=target_lang, report=report)
 
     # En-tête 100 % ASCII (RFC 5987) : un nom de fichier arabe/cyrillique/ accentu\u00e9
     # ne doit plus provoquer de UnicodeEncodeError -> HTTP 500.
@@ -120,6 +124,8 @@ async def _handle_translate_request(
         headers={
             "Content-Disposition": build_content_disposition(file.filename, target_lang.value),
             "X-Target-Language": target_lang.value,
+            # Traçabilité : quel moteur a réellement traduit, combien de blocs, etc.
+            **report.headers(),
         },
     )
 
@@ -255,6 +261,7 @@ def diagnostics() -> JSONResponse:
             "max_upload_mb": MAX_UPLOAD_MB,
             "max_pages": MAX_PAGES,
         },
+        "translation": {**chain_diagnostics(), "enabled": TRANSLATE_ENABLED, "source_lang": SOURCE_LANG},
         "fonts": fonts,
         "status": "ok" if fonts["amiri"]["ok"] else "degraded",
         "hint": (

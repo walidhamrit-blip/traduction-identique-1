@@ -122,3 +122,39 @@ Toutes les erreurs sont désormais renvoyées en JSON structuré — plus aucun 
 | `PDF_MAX_UPLOAD_MB` | `4` | Taille maximale du PDF (Mo) |
 | `PDF_MAX_PAGES` | `40` | Nombre maximal de pages par requête |
 | `PDF_MAX_BLOCKS_PER_PAGE` | `4000` | Garde-fou sur les PDF pathologiques |
+| `TRANSLATOR_PROVIDER` | `auto` | `auto`, `google_web`, `mymemory`, `libretranslate` ou `offline` |
+| `PDF_SOURCE_LANG` | `auto` | Langue source (`tr`, `en`, `fr`… ou `auto`) |
+| `PDF_TRANSLATE` | `1` | `0` = pas d'appel réseau (PDF nettoyé, sans traduction) |
+| `PDF_TRANSLATE_BUDGET_S` | `35` | Budget temps réseau avant assemblage |
+| `LIBRETRANSLATE_URL` | `https://libretranslate.com` | Instance LibreTranslate (utile en auto-hébergé) |
+
+---
+
+## Traduction **gratuite**, sans clé API
+
+Trois fournisseurs gratuits sont essayés dans l'ordre, sans carte bancaire :
+
+1. **`google_web`** — point d'entrée public de Google Traduction (`client=gtx`), gratuit et sans clé.
+2. **`mymemory`** — API gratuite sans clé (quota quotidien par IP).
+3. **`libretranslate`** — instance publique ou **auto-hébergée** (gratuit et sans limite si vous l'hébergez).
+4. **`offline`** — glossaire local, dernier recours.
+
+Garanties du pipeline :
+
+- **Aucune fausse traduction** : si aucun fournisseur ne répond, le texte d'origine est
+  conservé tel quel (fin du texte de remplissage « نص مترجم »).
+- **Codes et références intacts** : conteneurs (`CAAU2973244`), références (`I000503614`),
+  e-mails, téléphones, montants, coordonnées et artefacts CSS/JS ne sont **jamais** envoyés
+  au moteur ni masqués.
+- **Masquage sélectif** : seuls les blocs réellement traduits sont recouverts ; les autres
+  gardent leur texte et leur position d'origine (mise en page préservée).
+- **Cache de libellés** : un en-tête de tableau répété 50 fois n'est traduit qu'une fois.
+- **Traçabilité** : chaque réponse expose `X-Translation-Provider`, `X-Translation-Degraded`,
+  `X-Blocks-Translated`, `X-Blocks-Kept` ; `/api/diag` détaille l'ordre des fournisseurs.
+
+### Limites à connaître
+
+Les points d'entrée gratuits ne sont pas contractuels : Google peut limiter l'usage intensif,
+et MyMemory plafonne à quelques milliers de caractères par jour. Pour un usage régulier ou
+professionnel, **auto-hébergez LibreTranslate** (gratuit, illimité, qualité correcte) et
+pointez `LIBRETRANSLATE_URL` dessus.

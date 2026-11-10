@@ -29,6 +29,9 @@ class TextBlock:
     y1: float
     font_size: float = 11.0
     line_count: int = 1
+    # Ligne de base réelle du texte source (origine en bas, coordonnées PDF).
+    # Permet de réécrire la traduction exactement à la même hauteur.
+    baseline_y: float | None = None
 
     @property
     def width(self) -> float:
