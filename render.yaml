@@ -1,0 +1,28 @@
+services:
+  # Déploiement Render (gratuit). Le plan gratuit n'a PAS de disque persistant :
+  # aucun fichier n'est écrit sur le disque, tout se fait en mémoire.
+  - type: web
+    name: traduction-pdf
+    runtime: python
+    plan: free
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
+    # Render fournit le port dans $PORT : il ne faut jamais coder 8000 en dur.
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /api/health
+    autoDeploy: true
+    envVars:
+      # La version Python vient du fichier .python-version (3.12) présent à la racine.
+      # Limites adaptées à Render (pas de plafond Vercel à 4,5 Mo), mais 512 Mo de RAM
+      # sur le plan gratuit : on reste prudent pour éviter les OOM.
+      - key: PDF_MAX_UPLOAD_MB
+        value: "15"
+      - key: PDF_MAX_PAGES
+        value: "30"
+      # Le plan gratuit met le service en veille : la première requête peut dépasser
+      # 50 s. On laisse un budget réseau généreux, mais sous la limite Render (100 s).
+      - key: PDF_TRANSLATE_BUDGET_S
+        value: "45"
+      - key: TRANSLATOR_PROVIDER
+        value: "auto"
+      - key: PDF_SOURCE_LANG
+        value: "auto"

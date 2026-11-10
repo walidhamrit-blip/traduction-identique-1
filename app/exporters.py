@@ -29,8 +29,8 @@ SUPPORTED_OUTPUT_FORMATS = {
 }
 
 
-def export_pdf_to_png(pdf_bytes: bytes, dpi: int = 130) -> bytes:
-    """Rasterise la première page en PNG (permet un aperçu fidèle dans l'éditeur)."""
+def export_pdf_to_png(pdf_bytes: bytes, dpi: int = 130, page: int = 1) -> bytes:
+    """Rasterise une page en PNG (aperçu de l'éditeur, export image)."""
     try:
         import pymupdf
     except ImportError as exc:  # pragma: no cover
@@ -45,13 +45,33 @@ def export_pdf_to_png(pdf_bytes: bytes, dpi: int = 130) -> bytes:
         document = pymupdf.open(stream=pdf_bytes, filetype="pdf")
         if document.page_count == 0:
             raise ExportFormatError("Le PDF exporté ne contient aucune page.")
-        page = document[0]
-        pixmap = page.get_pixmap(dpi=dpi)
+        index = max(0, min(page - 1, document.page_count - 1))
+        pixmap = document[index].get_pixmap(dpi=dpi)
         return pixmap.tobytes("png")
     except PdfServiceError:
         raise
     except Exception as exc:
         raise ExportFormatError(f"Échec de la conversion PNG : {exc}") from exc
+
+
+def export_pdf_to_png_pages(pdf_bytes: bytes, dpi: int = 110, max_pages: int = 10) -> list[bytes]:
+    """Rasterise plusieurs pages (borné pour ne pas saturer la mémoire d'un plan gratuit)."""
+    try:
+        import pymupdf
+    except ImportError as exc:  # pragma: no cover
+        raise ExportFormatError(
+            "Le rendu PNG n'est pas disponible sur ce déploiement.",
+            hint="Ajoutez 'pymupdf' dans requirements.txt pour activer l'export image.",
+            status_code=503,
+            code="png_export_missing",
+        ) from exc
+
+    images: list[bytes] = []
+    document = pymupdf.open(stream=pdf_bytes, filetype="pdf")
+    for index in range(min(document.page_count, max_pages)):
+        pixmap = document[index].get_pixmap(dpi=dpi)
+        images.append(pixmap.tobytes("png"))
+    return images
 
 
 def export_text(pages: list[list[tuple[object, str]]], *, include_original: bool = False) -> bytes:
