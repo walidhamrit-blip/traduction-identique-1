@@ -72,8 +72,53 @@ curl -X POST "http://localhost:8000/translate" \
 
 ## Déploiement Vercel Serverless
 
-Le fichier `vercel.json` route les requêtes vers `api/index.py` et embarque explicitement les polices TTF via `"includeFiles": "{app/**,assets/fonts/**}"` :
+Le fichier `vercel.json` déclare le preset `fastapi` et exclut les fichiers inutiles du bundle ;
+le point d'entrée est `api/index.py` (objet `app`), et les polices TTF de `assets/fonts/`
+sont incluses automatiquement dans le bundle de la fonction (Vercel embarque tous les fichiers
+du projet pour une app Python ; rien n'est « tree-shaké »).
 
 ```bash
 vercel deploy --prod
 ```
+
+Configuration associée :
+
+- `.python-version` → `3.12` (versions Vercel : 3.12 / 3.13 / 3.14).
+- `requirements.txt` → versions **épinglées** (une montée de version majeure de `python-bidi`,
+  `pypdf` ou `reportlab` peut casser l'import → 500 au runtime).
+- Limite d'upload par défaut : **4 Mo** (Vercel rejette les corps > 4,5 Mo avant la fonction).
+
+### Diagnostic des erreurs HTTP 500
+
+`GET /api/diag` renvoie l'environnement d'exécution (chemins, présence des polices TTF,
+versions réellement installées). C'est le premier appel à faire en cas d'erreur.
+
+Toutes les erreurs sont désormais renvoyées en JSON structuré — plus aucun 500 muet :
+
+| Statut | `detail.code` | Cause |
+| --- | --- | --- |
+| 400 | `invalid_pdf` | Fichier non-PDF, tronqué ou corrompu |
+| 400 | `encrypted_pdf` | PDF protégé par mot de passe |
+| 400 | `empty_pdf` | Fichier vide / aucune page |
+| 413 | `payload_too_large` | Fichier > `PDF_MAX_UPLOAD_MB` (ou > 4,5 Mo sur Vercel) |
+| 413 | `too_many_pages` | Plus de `PDF_MAX_PAGES` pages |
+| 422 | `pdf_processing_failed` | Rendu/fusion impossible (PDF exotique) |
+| 503 | `font_unavailable` | `assets/fonts/*.ttf` absent du bundle déployé |
+
+```json
+{
+  "detail": {
+    "code": "encrypted_pdf",
+    "message": "Le PDF est chiffré ou protégé par un mot de passe...",
+    "hint": "Retirez la protection par mot de passe du PDF puis réessayez."
+  }
+}
+```
+
+### Variables d'environnement (optionnelles)
+
+| Variable | Défaut | Rôle |
+| --- | --- | --- |
+| `PDF_MAX_UPLOAD_MB` | `4` | Taille maximale du PDF (Mo) |
+| `PDF_MAX_PAGES` | `40` | Nombre maximal de pages par requête |
+| `PDF_MAX_BLOCKS_PER_PAGE` | `4000` | Garde-fou sur les PDF pathologiques |

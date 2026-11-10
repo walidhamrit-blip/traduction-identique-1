@@ -1,0 +1,21 @@
+# Environnements virtuels locaux
+.venv/
+.venv-*/
+venv/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+
+# Vercel
+.vercel/
+
+# Systèmes
+.DS_Store
+
+# Fichiers générés lors des tests manuels
+/tmp_*.pdf
+/translated_*.pdf

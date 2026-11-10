@@ -111,3 +111,102 @@ def test_fastapi_rejects_invalid_inputs() -> None:
         data={"target_lang": "fr"},
     )
     assert bad_file.status_code == 400
+
+
+# ---------------------------------------------------------------------------
+# Non-régression « erreur HTTP 500 » : chaque cas doit produire une réponse
+# JSON explicite (code + message + hint), jamais un 500 muet.
+# ---------------------------------------------------------------------------
+
+
+def _make_encrypted_pdf() -> bytes:
+    """PDF valide mais protégé par mot de passe (cause classique de 500 côté pdfminer)."""
+    from pypdf import PdfWriter
+
+    writer = PdfWriter(clone_from=PdfReader(io.BytesIO(generate_sample_pdf())))
+    writer.encrypt("s3cret")
+    buf = io.BytesIO()
+    writer.write(buf)
+    return buf.getvalue()
+
+
+def test_encrypted_pdf_returns_400_not_500() -> None:
+    response = client.post(
+        "/translate",
+        files={"file": ("secret.pdf", _make_encrypted_pdf(), "application/pdf")},
+        data={"target_lang": "ar"},
+    )
+    assert response.status_code == 400
+    detail = response.json()["detail"]
+    assert detail["code"] == "encrypted_pdf"
+    assert detail["hint"]
+
+
+def test_truncated_pdf_returns_400_not_500() -> None:
+    truncated = generate_sample_pdf()[:400]
+    response = client.post(
+        "/translate",
+        files={"file": ("broken.pdf", truncated, "application/pdf")},
+        data={"target_lang": "fr"},
+    )
+    assert response.status_code == 400
+    assert response.json()["detail"]["code"] == "invalid_pdf"
+
+
+def test_extract_on_encrypted_pdf_returns_400_not_500() -> None:
+    response = client.post(
+        "/extract",
+        files={"file": ("secret.pdf", _make_encrypted_pdf(), "application/pdf")},
+        data={"target_lang": "ar"},
+    )
+    assert response.status_code == 400
+    assert response.json()["detail"]["code"] == "encrypted_pdf"
+
+
+def test_upload_limit_uses_configured_value(monkeypatch) -> None:
+    import api.index as api_module
+
+    monkeypatch.setattr(api_module, "MAX_UPLOAD_BYTES", 10)
+    monkeypatch.setattr(api_module, "MAX_UPLOAD_MB", 1)
+    response = client.post(
+        "/translate",
+        files={"file": ("big.pdf", generate_sample_pdf(), "application/pdf")},
+        data={"target_lang": "en"},
+    )
+    assert response.status_code == 413
+    assert response.json()["detail"]["code"] == "payload_too_large"
+
+
+def test_too_many_pages_returns_explicit_error(monkeypatch) -> None:
+    import app.extractor as extractor_module
+
+    monkeypatch.setattr(extractor_module, "MAX_PAGES", 1)
+    from pypdf import PdfWriter
+
+    writer = PdfWriter(clone_from=PdfReader(io.BytesIO(generate_sample_pdf())))
+    writer.add_blank_page(width=595, height=842)
+    buf = io.BytesIO()
+    writer.write(buf)
+
+    response = client.post(
+        "/translate",
+        files={"file": ("two_pages.pdf", buf.getvalue(), "application/pdf")},
+        data={"target_lang": "en"},
+    )
+    assert response.status_code == 413
+    assert response.json()["detail"]["code"] == "too_many_pages"
+
+
+def test_diag_endpoint_reports_fonts_and_versions() -> None:
+    response = client.get("/diag")
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["fonts"]["amiri"]["ok"] is True
+    assert payload["status"] == "ok"
+    assert "pypdf" in payload["dependencies"]
+    assert "ERREUR" not in payload["dependencies"]["pypdf"]
+
+
+def test_health_still_ok() -> None:
+    assert client.get("/health").status_code == 200
+    assert client.get("/api/health").status_code == 200

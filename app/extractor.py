@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import io
+import logging
 from collections.abc import Iterator
+
 from pdfminer.high_level import extract_pages
 from pdfminer.layout import (
     LAParams,
@@ -14,8 +16,77 @@ from pdfminer.layout import (
     LTTextContainer,
     LTTextLine,
 )
+from pdfminer.pdfdocument import PDFPasswordIncorrect
+from pdfminer.pdfparser import PDFSyntaxError
+from pypdf.errors import DependencyError, PdfReadError, PdfStreamError
 
+from app.config import MAX_BLOCKS_PER_PAGE, MAX_PAGES
+from app.errors import EncryptedPdfError, InvalidPdfError, TooManyPagesError
 from app.schemas import ExtractedPage, TextBlock
+
+logger = logging.getLogger(__name__)
+
+# Signatures d'erreur indiquant un PDF chiffré, quel que soit le lecteur
+_ENCRYPTED_MARKERS = (
+    "password",
+    "encrypted",
+    "crypt",
+    "decrypt",
+    "aes",
+)
+
+
+def _looks_encrypted(exc: BaseException) -> bool:
+    """Heuristique : pypdf/pdfminer signalent un chiffrement de façons très variées."""
+    if isinstance(exc, (PDFPasswordIncorrect,)):
+        return True
+    text = f"{type(exc).__name__}: {exc}".lower()
+    return any(marker in text for marker in _ENCRYPTED_MARKERS)
+
+
+def _probe_pdf(pdf_bytes: bytes) -> None:
+    """Ouvre le PDF avec pypdf pour détecter tôt chiffrement et corruption.
+
+    pdfminer, lui, échoue souvent avec un message interne peu lisible
+    (`PDFSyntaxError`, `KeyError`…) qui produisait un HTTP 500 générique.
+    """
+    try:
+        from pypdf import PdfReader
+
+        reader = PdfReader(io.BytesIO(pdf_bytes), strict=False)
+        if reader.is_encrypted:
+            try:
+                unlocked = reader.decrypt("")
+            except Exception:  # pragma: no cover - dépend de la version pypdf
+                unlocked = 0
+            if not unlocked:
+                raise EncryptedPdfError(
+                    "Le PDF est chiffré ou protégé par un mot de passe : "
+                    "son contenu texte ne peut pas être extrait."
+                )
+        page_count = len(reader.pages)
+    except (EncryptedPdfError, TooManyPagesError):
+        raise
+    except (PdfReadError, PdfStreamError, DependencyError, ValueError, KeyError) as exc:
+        if _looks_encrypted(exc):
+            raise EncryptedPdfError(
+                f"Le PDF semble chiffré et ne peut pas être ouvert ({exc})."
+            ) from exc
+        raise InvalidPdfError(f"Le PDF n'a pas pu être ouvert : {exc}") from exc
+    except Exception as exc:  # défense en profondeur : jamais de 500 opaque
+        if _looks_encrypted(exc):
+            raise EncryptedPdfError(
+                f"Le PDF semble chiffré et ne peut pas être ouvert ({exc})."
+            ) from exc
+        raise InvalidPdfError(f"Le PDF n'a pas pu être ouvert : {exc}") from exc
+
+    if page_count == 0:
+        raise InvalidPdfError("Le PDF ne contient aucune page.")
+    if page_count > MAX_PAGES:
+        raise TooManyPagesError(
+            f"Le PDF contient {page_count} pages, au-delà de la limite de "
+            f"{MAX_PAGES} pages par requête."
+        )
 
 
 def _extract_median_font_size(element: LTTextContainer | LTTextLine) -> float:
@@ -74,7 +145,11 @@ def extract_pdf_layout(pdf_bytes: bytes) -> list[ExtractedPage]:
     """Extrait page par page les blocs de texte et leurs coordonnées exactes `(x0, y0, x1, y1)`.
 
     Utilise `pdfminer.six` (`extract_pages` + `LAParams`) conformément à la spécification.
+    Lève `EncryptedPdfError` / `InvalidPdfError` / `TooManyPagesError` (erreurs HTTP
+    explicites) plutôt que de laisser remonter une exception brute.
     """
+    _probe_pdf(pdf_bytes)
+
     laparams = LAParams(
         line_margin=0.55,
         char_margin=1.5,
@@ -85,12 +160,39 @@ def extract_pdf_layout(pdf_bytes: bytes) -> list[ExtractedPage]:
 
     extracted_pages: list[ExtractedPage] = []
 
-    for page_index, lt_page in enumerate(
-        extract_pages(io.BytesIO(pdf_bytes), laparams=laparams)
-    ):
+    def _pages() -> Iterator[object]:
+        try:
+            yield from extract_pages(io.BytesIO(pdf_bytes), laparams=laparams)
+        except Exception as exc:  # remonte l'erreur typée au code appelant
+            if _looks_encrypted(exc):
+                raise EncryptedPdfError(
+                    f"Le PDF est chiffré ou corrompu et ne peut pas être analysé ({exc})."
+                ) from exc
+            if isinstance(exc, (PDFSyntaxError, PdfReadError, PdfStreamError, KeyError, ValueError)):
+                raise InvalidPdfError(
+                    f"Le PDF n'a pas pu être analysé par pdfminer.six : {exc}"
+                ) from exc
+            raise
+
+    for page_index, lt_page in enumerate(_pages()):
+        if page_index >= MAX_PAGES:
+            raise TooManyPagesError(
+                f"Le PDF dépasse la limite de {MAX_PAGES} pages par requête."
+            )
+        if not isinstance(lt_page, LTPage):  # pragma: no cover - garde-fou
+            continue
+
         blocks: list[TextBlock] = []
 
         for container in _iter_text_containers(lt_page):
+            if len(blocks) >= MAX_BLOCKS_PER_PAGE:
+                logger.warning(
+                    "Limite de %s blocs atteinte sur la page %s : le reste est ignoré.",
+                    MAX_BLOCKS_PER_PAGE,
+                    page_index + 1,
+                )
+                break
+
             raw_text = container.get_text()
             if not raw_text or not raw_text.strip():
                 continue
@@ -106,6 +208,8 @@ def extract_pdf_layout(pdf_bytes: bytes) -> list[ExtractedPage]:
             ):
                 # Conserve la Bounding Box individuelle de chaque ligne (tableaux, métadonnées)
                 for line in text_lines:
+                    if len(blocks) >= MAX_BLOCKS_PER_PAGE:
+                        break
                     cleaned = " ".join(line.get_text().split())
                     if not cleaned:
                         continue

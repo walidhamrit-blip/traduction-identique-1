@@ -7,22 +7,36 @@ Compatible simultanément avec :
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Annotated
 
-from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, Response
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 
 from app.arabic_utils import format_arabic_text
+from app.config import (
+    MAX_PAGES,
+    MAX_UPLOAD_BYTES,
+    MAX_UPLOAD_MB,
+    PROJECT_ROOT,
+    SERVICE_VERSION,
+)
+from app.errors import (
+    EmptyPdfError,
+    InvalidPdfError,
+    PayloadTooLargeError,
+    PdfServiceError,
+)
 from app.extractor import extract_pdf_layout
 from app.pipeline import translate_pdf_bytes
-from app.renderer import ensure_fonts_registered
+from app.renderer import ensure_fonts_registered, fonts_diagnostics
 from app.sample_generator import generate_sample_pdf
 from app.schemas import TargetLang
 from app.translator import mock_translate
 
-MAX_PDF_SIZE_BYTES = 20 * 1024 * 1024  # 20 Mo
+logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title="PDF Layout-Preserving Translator Microservice",
@@ -32,7 +46,7 @@ app = FastAPI(
         "reshaping + BiDi RTL (`arabic-reshaper` & `python-bidi`), calque `reportlab` "
         "et fusion `pypdf`."
     ),
-    version="1.0.0",
+    version=SERVICE_VERSION,
 )
 
 app.add_middleware(
@@ -43,6 +57,36 @@ app.add_middleware(
 )
 
 
+@app.exception_handler(PdfServiceError)
+async def _pdf_service_error_handler(request: Request, exc: PdfServiceError) -> JSONResponse:
+    """Transforme toute erreur métier en réponse JSON explicite (code + message + conseil)."""
+    logger.warning(
+        "Erreur métier %s sur %s : %s", exc.code, request.url.path, exc.message
+    )
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"detail": exc.to_dict()},
+        headers={"X-Error-Code": exc.code},
+    )
+
+
+@app.exception_handler(Exception)
+async def _unhandled_error_handler(request: Request, exc: Exception) -> JSONResponse:
+    """Filet de sécurité : plus de 500 muet, on remonte le type et le message d'erreur."""
+    logger.exception("Exception non gérée sur %s", request.url.path)
+    return JSONResponse(
+        status_code=500,
+        content={
+            "detail": {
+                "code": "internal_error",
+                "message": f"{type(exc).__name__}: {exc}",
+                "hint": "Consultez /api/diag et les logs de la fonction (Vercel > Deployments > Logs).",
+            }
+        },
+        headers={"X-Error-Code": "internal_error"},
+    )
+
+
 async def _handle_translate_request(
     file: UploadFile,
     target_lang: TargetLang,
@@ -50,29 +94,22 @@ async def _handle_translate_request(
     """Valide l'entrée, exécute le pipeline de traduction PDF et retourne le binaire PDF."""
     pdf_bytes = await file.read()
     if not pdf_bytes:
-        raise HTTPException(status_code=400, detail="Le fichier envoyé est vide.")
+        raise EmptyPdfError("Le fichier envoyé est vide.")
 
-    if len(pdf_bytes) > MAX_PDF_SIZE_BYTES:
-        raise HTTPException(
-            status_code=413,
-            detail="Le fichier dépasse la taille maximale autorisée (20 Mo).",
+    if len(pdf_bytes) > MAX_UPLOAD_BYTES:
+        raise PayloadTooLargeError(
+            f"Le fichier ({len(pdf_bytes) / (1024 * 1024):.1f} Mo) dépasse la taille "
+            f"maximale autorisée ({MAX_UPLOAD_MB} Mo)."
         )
 
     if not pdf_bytes.lstrip().startswith(b"%PDF-"):
-        raise HTTPException(
-            status_code=400,
-            detail="Format invalide : seuls les fichiers PDF valides (%PDF-) sont acceptés.",
+        raise InvalidPdfError(
+            "Format invalide : seuls les fichiers PDF valides (%PDF-) sont acceptés."
         )
 
-    try:
-        translated_pdf = translate_pdf_bytes(pdf_bytes, target_lang=target_lang)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except Exception as exc:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Erreur lors du traitement du PDF : {exc}",
-        ) from exc
+    # `translate_pdf_bytes` lève des `PdfServiceError` typées (400/413/422/503),
+    # interceptées par le gestionnaire global : plus aucun 500 opaque.
+    translated_pdf = translate_pdf_bytes(pdf_bytes, target_lang=target_lang)
 
     original_stem = Path(file.filename or "document.pdf").stem
     safe_stem = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in original_stem)
@@ -131,7 +168,11 @@ async def inspect_extraction_endpoint(
 ) -> dict:
     pdf_bytes = await file.read()
     if not pdf_bytes or not pdf_bytes.lstrip().startswith(b"%PDF-"):
-        raise HTTPException(status_code=400, detail="Fichier PDF invalide.")
+        raise InvalidPdfError("Fichier PDF invalide.")
+    if len(pdf_bytes) > MAX_UPLOAD_BYTES:
+        raise PayloadTooLargeError(
+            f"Le fichier dépasse la taille maximale autorisée ({MAX_UPLOAD_MB} Mo)."
+        )
 
     pages = extract_pdf_layout(pdf_bytes)
     return {
@@ -189,6 +230,62 @@ def healthcheck() -> dict:
             "merge": "pypdf",
         },
     }
+
+
+@app.get("/diag", summary="Diagnostic de l'environnement de déploiement (polices, chemins, limites)")
+@app.get("/api/diag", include_in_schema=False)
+def diagnostics() -> JSONResponse:
+    """Diagnostic non destructif : répond 200 même si les polices sont absentes.
+
+    C'est le premier appel à faire quand une requête renvoie une erreur 500 :
+    il montre si `assets/fonts/*.ttf` a bien été embarqué dans le bundle Vercel.
+    """
+    fonts = fonts_diagnostics()
+    payload = {
+        "service": {
+            "version": SERVICE_VERSION,
+            "project_root": str(PROJECT_ROOT),
+            "cwd": str(Path.cwd()),
+            "python": __import__("sys").version.split()[0],
+        },
+        "limits": {
+            "max_upload_mb": MAX_UPLOAD_MB,
+            "max_pages": MAX_PAGES,
+        },
+        "fonts": fonts,
+        "status": "ok" if fonts["amiri"]["ok"] else "degraded",
+        "hint": (
+            None
+            if fonts["amiri"]["ok"]
+            else (
+                "Police arabe absente du bundle. Ajoutez 'assets/fonts/**' dans "
+                "includeFiles de vercel.json puis redéployez."
+            )
+        ),
+        "dependencies": _dependency_versions(),
+    }
+    return JSONResponse(payload)
+
+
+def _dependency_versions() -> dict[str, str]:
+    """Versions effectives des dépendances critiques (les 500 viennent souvent d'un décalage)."""
+    versions: dict[str, str] = {}
+    for module_name, package_name in (
+        ("fastapi", "fastapi"),
+        ("starlette", "starlette"),
+        ("pydantic", "pydantic"),
+        ("pdfminer", "pdfminer.six"),
+        ("pypdf", "pypdf"),
+        ("reportlab", "reportlab"),
+        ("arabic_reshaper", "arabic-reshaper"),
+        ("bidi", "python-bidi"),
+    ):
+        try:
+            module = __import__(module_name)
+            versions[package_name] = str(getattr(module, "__version__", "unknown"))
+        except Exception as exc:  # pragma: no cover - dépend de l'environnement
+            versions[package_name] = f"ERREUR D'IMPORT: {type(exc).__name__}: {exc}"
+    return versions
 
 
 @app.get("/", response_class=HTMLResponse, include_in_schema=False)
@@ -443,6 +540,19 @@ def interactive_console() -> HTMLResponse:
       statusBox.className = "status " + kind;
     }
 
+    // Transforme une réponse d'erreur JSON (detail string ou objet structuré) en message lisible
+    function describeError(errJson, httpStatus) {
+      const detail = errJson && errJson.detail;
+      if (detail && typeof detail === "object") {
+        const parts = [detail.message || detail.code || "Erreur inconnue"];
+        if (detail.code) parts.push("(code: " + detail.code + ")");
+        if (detail.hint) parts.push("— " + detail.hint);
+        return parts.join(" ");
+      }
+      if (typeof detail === "string") return detail;
+      return "Erreur HTTP " + httpStatus;
+    }
+
     function showOriginalBlob(blob, filename) {
       currentPdfBlob = blob;
       currentFilename = filename;
@@ -467,7 +577,10 @@ def interactive_console() -> HTMLResponse:
       try {
         setStatus("Chargement du PDF de démonstration...", "info");
         const res = await fetch("./api/sample");
-        if (!res.ok) throw new Error("Impossible de récupérer le PDF de démonstration.");
+        if (!res.ok) {
+          const errJson = await res.json().catch(() => ({}));
+          throw new Error(describeError(errJson, res.status));
+        }
         const blob = await res.blob();
         showOriginalBlob(blob, "sample_invoice.pdf");
         await runTranslation();
@@ -486,18 +599,22 @@ def interactive_console() -> HTMLResponse:
       setStatus("Extraction pdfminer.six, traduction (" + lang + ") et fusion ReportLab/pypdf en cours...", "info");
 
       try {
-        const formData = new FormData();
-        formData.append("file", currentPdfBlob, currentFilename);
-        formData.append("target_lang", lang);
+        const buildForm = () => {
+          const fd = new FormData();
+          fd.append("file", currentPdfBlob, currentFilename);
+          fd.append("target_lang", lang);
+          return fd;
+        };
 
+        // Deux FormData distincts : un corps multipart ne peut pas être rejoué deux fois
         const [pdfRes, extRes] = await Promise.all([
-          fetch("./api/translate", { method: "POST", body: formData }),
-          fetch("./api/extract", { method: "POST", body: formData })
+          fetch("./api/translate", { method: "POST", body: buildForm() }),
+          fetch("./api/extract", { method: "POST", body: buildForm() })
         ]);
 
         if (!pdfRes.ok) {
           const errJson = await pdfRes.json().catch(() => ({}));
-          throw new Error(errJson.detail || ("Erreur HTTP " + pdfRes.status));
+          throw new Error(describeError(errJson, pdfRes.status));
         }
 
         const outBlob = await pdfRes.blob();

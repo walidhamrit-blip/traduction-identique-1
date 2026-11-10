@@ -2,9 +2,9 @@
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "framework": "fastapi",
   "functions": {
-    "main.py": {
+    "api/index.py": {
       "maxDuration": 60,
-      "includeFiles": "{api/**,app/**,assets/fonts/**}"
+      "excludeFiles": "{tests/**,samples/**,**/__pycache__/**,**/*.pyc}"
     }
   }
 }
