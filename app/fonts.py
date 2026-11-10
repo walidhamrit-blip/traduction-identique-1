@@ -156,6 +156,19 @@ def _register_path(name: str, path: Path) -> str:
     return name
 
 
+def release_fonts() -> None:
+    """Retire les TTF du cache ReportLab (utile sur les hébergements à mémoire limitée).
+
+    ReportLab conserve le contenu des fichiers de police en mémoire ; sur le plan
+    gratuit Render (512 Mo) on libère ce cache après chaque requête.
+    """
+    from reportlab.pdfbase import pdfmetrics
+
+    for name in list(_REGISTERED):
+        pdfmetrics._fonts.pop(name, None)  # type: ignore[attr-defined]
+    _REGISTERED.clear()
+
+
 def ensure_family_registered(family: FontFamily, *, bold: bool = False) -> str:
     """Enregistre (ou réutilise) la police d'une famille et retourne son nom ReportLab."""
     use_bold = bool(bold and family.bold)

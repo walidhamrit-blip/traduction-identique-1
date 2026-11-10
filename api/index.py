@@ -388,6 +388,9 @@ async def preview_endpoint(
     edits: Annotated[
         str | None, Form(description="Corrections par bloc JSON")
     ] = None,
+    dpi: Annotated[
+        int, Form(description="Résolution de l'aperçu (80 = léger, 110 = net, 150 = haute)")
+    ] = 100,
 ) -> dict:
     """Retourne tout ce dont l'éditeur a besoin **avant** l'export :
 
@@ -421,7 +424,8 @@ async def preview_endpoint(
 
         document = pymupdf.open(stream=translated_pdf, filetype="pdf")
         index = max(0, min(page - 1, document.page_count - 1))
-        pixmap = document[index].get_pixmap(dpi=110)
+        # DPI borné : un aperçu 150 dpi sur un plan gratuit peut dépasser la mémoire
+        pixmap = document[index].get_pixmap(dpi=max(60, min(dpi, 150)))
         preview_png = base64.b64encode(pixmap.tobytes("png")).decode("ascii")
         page_count = document.page_count
         page_sizes = [

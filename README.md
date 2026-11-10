@@ -205,3 +205,54 @@ curl -X POST http://localhost:8000/translate \
 ```
 
 Polices proposées par `GET /api/fonts`, formats supportés par `GET /api/formats`.
+
+---
+
+## Déploiement Render (gratuit, sans carte bancaire)
+
+Render héberge le service sans plafond de 4,5 Mo et sans configuration exotique.
+Le fichier **`render.yaml`** décrit le service ; il suffit de l'utiliser comme Blueprint.
+
+### Champs exacts à saisir dans Render (New → Web Service)
+
+| Champ Render | Valeur à saisir | Erreur fréquente |
+| --- | --- | --- |
+| **Name** | `traduction-pdf` | — |
+| **Language / Runtime** | `Python 3` | choisir *Node* ou *Docker* |
+| **Branch** | `main` | brancher une branche de travail |
+| **Root Directory** | *(vide)* | mettre `src` ou `/` alors que le projet est à la racine |
+| **Build Command** | `pip install -r requirements.txt` | `npm install`, ou commande vide |
+| **Start Command** | `uvicorn main:app --host 0.0.0.0 --port $PORT` | **`npm start`** (c'est l'erreur visible sur votre capture), ou un port `8000` codé en dur |
+| **Instance Type** | `Free` | — |
+| **Python version** | via `.python-version` (3.12) | — |
+
+> ⚠️ Sur Render, le port est fourni par la variable `$PORT`. Une commande
+> `uvicorn ... --port 8000` échoue au health check : le service démarre puis est
+> marqué « unhealthy ».
+
+### ⚠️ Erreur « Publish Directory » (visible sur votre capture)
+
+Render n'a **pas** de champ « Publish Directory » : ce champ appartient à un
+service **Static Site** (site statique). Pour une application FastAPI, le
+réglage correct est le *Start Command* ci-dessus. Si Render insiste sur un
+répertoire de publication, c'est que le service a été créé en *Static Site* :
+supprimez-le et recréez un **Web Service** (ou importez le Blueprint `render.yaml`).
+
+### Variables d'environnement recommandées
+
+`render.yaml` les configure automatiquement pour le plan gratuit :
+
+| Variable | Valeur | Pourquoi |
+| --- | --- | --- |
+| `PDF_MAX_UPLOAD_MB` | `15` | 512 Mo de RAM : au-delà, risque d'OOM |
+| `PDF_MAX_PAGES` | `30` | limite le temps de traitement |
+| `PDF_TRANSLATE_BUDGET_S` | `45` | sous la limite Render de 100 s |
+| `TRANSLATOR_PROVIDER` | `auto` | chaîne gratuite sans clé |
+
+### Bon à savoir sur le plan gratuit Render
+
+- Le service **s'endort** après 15 min d'inactivité : la première requête peut
+  prendre 30 à 50 s (le temps du réveil). C'est normal.
+- **Aucun disque persistant** : le service n'écrit rien sur le disque, tout est
+  traité en mémoire — c'est déjà le cas.
+- `healthCheckPath: /api/health` permet à Render de vérifier le service.

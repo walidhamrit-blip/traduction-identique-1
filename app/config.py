@@ -77,3 +77,14 @@ TRANSLATE_TIME_BUDGET_S = _env_float("PDF_TRANSLATE_BUDGET_S", 35.0, minimum=5.0
 
 # Langues cibles supportées par les fournisseurs gratuits
 SUPPORTED_SOURCE_LANGS = ("auto", "tr", "en", "fr", "ar", "es", "de", "it", "ru", "zh", "nl")
+
+# ---------------------------------------------------------------------------
+# Béton armé pour hébergements gratuits (Render free = 512 Mo de RAM, CPU limité)
+# ---------------------------------------------------------------------------
+# Les polices TTF ne sont pas chargées une fois pour toutes : les garder en
+# mémoire en permanence coûte ~3 Mo. On les enregistre à la demande (lazy) et on
+# libère le cache après chaque requête pour éviter les dépassements mémoire.
+LAZY_FONTS = (os.getenv("PDF_LAZY_FONTS", "0") or "0").strip().lower() in ("1", "true", "yes")
+
+# Nombre de pages rasterisées simultanément pour un export PNG multi-pages.
+MAX_PNG_PAGES = _env_int("PDF_MAX_PNG_PAGES", 10, minimum=1)
