@@ -109,6 +109,22 @@ def _extract_median_font_size(element: LTTextContainer | LTTextLine) -> float:
     return round(max(6.0, min(24.0, element.height * 0.75)), 2)
 
 
+def _baseline_y(line: LTTextLine) -> float | None:
+    """Estime la ligne de base d'une ligne pdfminer (y0 + profondeur de descente).
+
+    pdfminer ne fournit pas la ligne de base directement ; le bas de la boîte de la
+    ligne correspond au point le plus bas des glyphes (descendantes incluses), donc
+    légèrement sous la ligne de base. On ajoute une fraction de la hauteur des
+    glyphes pour retrouver un alignement visuel correct.
+    """
+    sizes = [ch.size for ch in line if isinstance(ch, LTChar) and ch.size > 0]
+    if not sizes:
+        return None
+    sizes.sort()
+    median = float(sizes[len(sizes) // 2])
+    return float(line.y0) + median * 0.20
+
+
 def _iter_text_containers(component: LTComponent) -> Iterator[LTTextContainer]:
     """Parcourt récursivement l'arbre `pdfminer.six` (y compris `LTFigure`) pour trouver les blocs texte."""
     if isinstance(component, LTTextContainer):
@@ -223,6 +239,7 @@ def extract_pdf_layout(pdf_bytes: bytes) -> list[ExtractedPage]:
                             y1=float(y1),
                             font_size=_extract_median_font_size(line),
                             line_count=1,
+                            baseline_y=_baseline_y(line),
                         )
                     )
             else:
@@ -239,6 +256,7 @@ def extract_pdf_layout(pdf_bytes: bytes) -> list[ExtractedPage]:
                         y1=float(y1),
                         font_size=_extract_median_font_size(container),
                         line_count=max(1, len(text_lines)),
+                        baseline_y=_baseline_y(text_lines[0]) if text_lines else None,
                     )
                 )
 

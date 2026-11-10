@@ -53,3 +53,27 @@ MAX_BLOCKS_PER_PAGE = _env_int("PDF_MAX_BLOCKS_PER_PAGE", 4000, minimum=50)
 # Divers
 # ---------------------------------------------------------------------------
 SERVICE_VERSION = "1.1.0"
+
+# ---------------------------------------------------------------------------
+# Traduction (gratuite, sans clé API)
+# ---------------------------------------------------------------------------
+# Ordre des fournisseurs essayés (voir app/translation/chain.py).
+TRANSLATOR_PROVIDER = os.getenv("TRANSLATOR_PROVIDER", "auto").strip() or "auto"
+
+# Langue source : "auto" = détection par le fournisseur (recommandé).
+SOURCE_LANG = os.getenv("PDF_SOURCE_LANG", "auto").strip() or "auto"
+
+# Traduction activée par défaut ; PDF_TRANSLATE=0 renvoie le PDF nettoyé sans traduction.
+TRANSLATE_ENABLED = (os.getenv("PDF_TRANSLATE", "1") or "1").strip().lower() not in (
+    "0",
+    "false",
+    "no",
+    "off",
+)
+
+# Budget temps : au-delà, le pipeline cesse d'appeler le réseau et assemble ce
+# qui est déjà traduit (Vercel coupe la fonction à 60 s).
+TRANSLATE_TIME_BUDGET_S = _env_float("PDF_TRANSLATE_BUDGET_S", 35.0, minimum=5.0)
+
+# Langues cibles supportées par les fournisseurs gratuits
+SUPPORTED_SOURCE_LANGS = ("auto", "tr", "en", "fr", "ar", "es", "de", "it", "ru", "zh", "nl")
