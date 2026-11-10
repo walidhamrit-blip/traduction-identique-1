@@ -9,3 +9,8 @@ arabic-reshaper==3.0.0
 python-bidi==0.6.6
 reportlab==4.4.4
 pypdf==6.1.1
+
+# Formats et aperçu (facultatifs mais recommandés : sans eux, l'export PNG,
+# l'aperçu visuel de l'éditeur et la conversion .docx sont désactivés proprement).
+pymupdf==1.26.4
+python-docx==1.2.0
