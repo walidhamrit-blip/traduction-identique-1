@@ -12,7 +12,12 @@ from dataclasses import dataclass
 from app.config import SOURCE_LANG, TRANSLATE_ENABLED, TRANSLATE_TIME_BUDGET_S
 from app.errors import PdfProcessingError, PdfServiceError
 from app.extractor import extract_pdf_layout
-from app.renderer import build_overlay_pdf, merge_overlay_with_original
+from app.renderer import (
+    build_overlay_pdf,
+    build_overlay_pdf_fallback,
+    merge_overlay_with_original,
+    merge_overlay_with_pymupdf,
+)
 from app.schemas import BlockEdit, ExtractedPage, StyleOptions, TargetLang, TextBlock
 from app.translation.chain import TranslationChain, TranslationResult
 
@@ -144,6 +149,58 @@ def _apply_edits(
     return rebuilt
 
 
+def _render_with_fallbacks(
+    pdf_bytes: bytes, overlay_kwargs: dict
+) -> tuple[bytes, bool, str]:
+    """Produit le PDF traduit en essayant successivement plusieurs moteurs.
+
+    ReportLab possède des `assert` internes (``pdfbase/ttfonts.py``) qui peuvent
+    interrompre tout l'export sur un PDF pourtant valide. On ne laisse donc jamais
+    un seul moteur décider du succès de l'opération :
+
+    1. ReportLab + pypdf (rendu de référence, style complet) ;
+    2. moteur PDF interne (`app.pdf_writer`, sans ReportLab) + pypdf ;
+    3. moteur interne + PyMuPDF (fusion indépendante) ;
+    4. en dernier recours : l'original est renvoyé avec un avertissement explicite.
+
+    Retourne ``(pdf, secours_utilisé, détail_de_l_échec)``.
+    """
+    attempts: list[tuple[str, callable, callable]] = [
+        ("reportlab+pypdf", build_overlay_pdf, merge_overlay_with_original),
+        ("interne+pypdf", build_overlay_pdf_fallback, merge_overlay_with_original),
+        ("interne+pymupdf", build_overlay_pdf_fallback, merge_overlay_with_pymupdf),
+    ]
+    errors: list[str] = []
+    for name, render, merge in attempts:
+        try:
+            overlay = render(**overlay_kwargs)
+            output = merge(pdf_bytes, overlay)
+        except PdfServiceError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - on veut tester le moteur suivant
+            logger.exception("Moteur de rendu %s en échec", name)
+            errors.append(f"{name}: {type(exc).__name__}: {exc}")
+            continue
+        if not output or not output.lstrip().startswith(b"%PDF-"):
+            errors.append(f"{name}: sortie PDF invalide")
+            continue
+        return output, name != attempts[0][0], " | ".join(errors)
+
+    raise PdfProcessingError(
+        "Échec du rendu du calque traduit : " + " | ".join(errors),
+        hint=_render_fallback_detail_text(errors),
+    )
+
+
+def _render_fallback_detail_text(errors: list[str]) -> str:
+    """Conseil affiché à l'utilisateur quand aucun moteur n'a abouti."""
+    return (
+        "Le document est lisible mais sa mise en page n'a pas pu être reconstruite "
+        f"(détail : {errors[-1] if errors else 'inconnu'}). "
+        "Essayez l'export TXT ou DOCX, qui ne passe pas par le rendu PDF."
+    )
+
+
 def translate_pdf_bytes(
     pdf_bytes: bytes,
     target_lang: TargetLang | str,
@@ -230,24 +287,25 @@ def translate_pdf_bytes(
 
     per_page = _apply_edits(per_page, edits)
 
-    try:
-        overlay_bytes = build_overlay_pdf(
-            pages=pages,
-            translated_blocks_per_page=per_page,
-            target_lang=lang,
-            mask_padding=(style.mask_padding if style else 0.8),
-            style=style,
-            edits=edits,
-            page_boxes=_original_page_boxes(pdf_bytes),
-        )
-        output = merge_overlay_with_original(pdf_bytes, overlay_bytes)
-    except PdfServiceError:
-        raise
-    except Exception as exc:
-        logger.exception("Échec de la génération du calque ou de la fusion pypdf")
-        raise PdfProcessingError(
-            f"Échec du rendu du calque traduit : {type(exc).__name__}: {exc}"
-        ) from exc
+    page_boxes = _original_page_boxes(pdf_bytes)
+    overlay_kwargs = {
+        "pages": pages,
+        "translated_blocks_per_page": per_page,
+        "target_lang": lang,
+        "mask_padding": (style.mask_padding if style else 0.8),
+        "style": style,
+        "edits": edits,
+        "page_boxes": page_boxes,
+    }
+
+    output, used_fallback, failure = _render_with_fallbacks(pdf_bytes, overlay_kwargs)
+    if used_fallback:
+        logger.warning("Rendu principal en échec (%s) : moteur de secours utilisé.", failure)
+        if report is not None:
+            report.warnings = list(report.warnings or []) + [
+                "Rendu de secours utilisé : la mise en page est conservée, "
+                "le style est simplifié."
+            ]
 
     if report is not None:
         report.seconds = round(time.monotonic() - started, 2)

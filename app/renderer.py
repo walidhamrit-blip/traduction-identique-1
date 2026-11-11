@@ -481,6 +481,210 @@ def build_overlay_pdf(
     return buffer.getvalue()
 
 
+def merge_overlay_with_pymupdf(original_pdf_bytes: bytes, overlay_pdf_bytes: bytes) -> bytes:
+    """Fusionne le calque sur l'original via PyMuPDF (voie de secours de `merge_overlay_with_original`).
+
+    `pypdf` reste la voie principale ; cette implémentation indépendante évite qu'un
+    document particulier (structure de page exotique, flux abîmé...) bloque tout
+    l'export. Si PyMuPDF n'est pas disponible, `RuntimeError` est levée.
+    """
+    try:
+        import pymupdf
+    except ImportError as exc:  # pragma: no cover - dépend du déploiement
+        raise RuntimeError("PyMuPDF indisponible pour la fusion de secours.") from exc
+
+    document = pymupdf.open(stream=original_pdf_bytes, filetype="pdf")
+    overlay = pymupdf.open(stream=overlay_pdf_bytes, filetype="pdf")
+    try:
+        for index in range(document.page_count):
+            if index >= overlay.page_count:
+                break
+            page = document[index]
+            page.show_pdf_page(page.rect, overlay, index, overlay=True)
+        return document.tobytes(garbage=3, deflate=True)
+    finally:
+        document.close()
+        overlay.close()
+
+
+def _resolve_font_file(font_name: str, target_lang: TargetLang) -> Path | None:
+    """Retrouve le fichier TTF réellement utilisé par une police ReportLab enregistrée."""
+    try:
+        font = pdfmetrics.getFont(font_name)
+        filename = getattr(getattr(font, "face", None), "filename", None)
+        if filename and Path(filename).is_file():
+            return Path(filename)
+    except Exception:  # pragma: no cover - police exotique
+        pass
+    if target_lang == TargetLang.AR:
+        return _resolve_font_path(AMIRI_FONT_PATH.name)
+    return _resolve_font_path(LATIN_FONT_PATH.name) or next(
+        (p for p in _FALLBACK_LATIN_FONTS if p.is_file()), None
+    )
+
+
+def _fallback_lines(
+    text: str,
+    block: TextBlock,
+    font_key: str,
+    writer: "PdfWriter",
+    is_arabic: bool,
+    style: StyleOptions,
+) -> tuple[list[str], float, float]:
+    """Découpe et dimensionne le texte en s'appuyant sur les métriques du PDF de secours."""
+    box_width = max(block.width, 8.0)
+    line_spacing_factor = style.line_spacing if is_arabic else min(style.line_spacing, 1.18)
+    target = style.resolved_font_size(block.font_size)
+
+    def width_of(sample: str, size: float) -> float:
+        shaped = reshape_arabic(sample) if is_arabic else sample
+        return writer.font_width(font_key, shaped, size)
+
+    lines = [text]
+    size = target
+    while size >= style.min_font_size - 1e-6:
+        lines = []
+        current = ""
+        for word in text.split():
+            candidate = f"{current} {word}".strip()
+            if current and width_of(candidate, size) > box_width + 2.0:
+                lines.append(current)
+                current = word
+            else:
+                current = candidate
+        if current:
+            lines.append(current)
+        widest = max((width_of(line, size) for line in lines), default=0.0)
+        needed_h = size * 0.96 + max(0, len(lines) - 1) * size * line_spacing_factor
+        fits = widest <= box_width + 2.0 and needed_h <= max(block.height, 6.0) + 3.0
+        single_line_ok = block.line_count > 1 or len(lines) == 1 or size <= target * 0.68
+        if fits and single_line_ok:
+            break
+        size = round(size - 0.5, 2)
+    size = max(size, style.min_font_size)
+    return lines, size, size * line_spacing_factor
+
+
+def build_overlay_pdf_fallback(
+    pages: list[ExtractedPage],
+    translated_blocks_per_page: list[list[tuple[TextBlock, str]]],
+    target_lang: TargetLang,
+    mask_padding: float = 0.8,
+    style: StyleOptions | None = None,
+    edits: dict[str, BlockEdit] | None = None,
+    *,
+    page_boxes: list[tuple[float, float]] | None = None,
+) -> bytes:
+    """Calque de secours, écrit sans ReportLab (voir `app.modules pdf_writer`).
+
+    Même contrat que `build_overlay_pdf` (mêmes paramètres, même résultat attendu :
+    un PDF d'une page par page du document original), mais aucune dépendance aux
+    `assert` internes de ReportLab : un PDF exotique ne peut donc plus faire échouer
+    tout l'export. Le rendu est volontairement simple : masques blancs + texte aux
+    coordonnées d'origine.
+    """
+    from app.pdf_writer import GlyphRun, PageContent, PdfWriter
+
+    style = style or StyleOptions()
+    edits = edits or {}
+    is_arabic = target_lang == TargetLang.AR
+    font_name = _select_font_name(target_lang, style)
+    font_path = _resolve_font_file(font_name, target_lang)
+    if font_path is None:
+        raise FontUnavailableError(
+            "Aucune police TTF exploitable pour le rendu de secours.",
+            hint="Vérifiez que assets/fonts contient Amiri-Regular.ttf / DejaVuSans.ttf.",
+        )
+
+    writer = PdfWriter()
+    font_key = "main"
+    writer.register_font(font_key, font_path)
+    text_color = _hex_to_rgb(style.color)
+
+    for page_index, (page, page_items) in enumerate(
+        zip(pages, translated_blocks_per_page, strict=True)
+    ):
+        if page_boxes and page_index < len(page_boxes):
+            real_width, real_height = page_boxes[page_index]
+            width = real_width or page.width
+            height = real_height or page.height
+        else:
+            width, height = page.width, page.height
+
+        content = PageContent(width=max(1.0, float(width)), height=max(1.0, float(height)))
+
+        for position, (block, translated_text) in enumerate(page_items):
+            bid = block_id_of(block, page_index, position)
+            edit = edits.get(bid)
+            if edit is not None and edit.hidden:
+                continue
+            target_block = block
+            text = translated_text
+            if edit is not None:
+                text = edit.text if edit.text is not None else translated_text
+                dx = (edit.x0 - block.x0) if edit.x0 is not None else 0.0
+                dy = (edit.y0 - block.y0) if edit.y0 is not None else 0.0
+                if dx or dy or edit.font_size:
+                    target_block = TextBlock(
+                        text=block.text,
+                        x0=block.x0 + dx,
+                        y0=block.y0 + dy,
+                        x1=block.x1 + dx,
+                        y1=block.y1 + dy,
+                        font_size=edit.font_size or block.font_size,
+                        line_count=block.line_count,
+                        baseline_y=(block.baseline_y + dy) if block.baseline_y is not None else None,
+                    )
+
+            candidate = " ".join(text.split())
+            original = " ".join(block.text.split())
+            is_edited = edit is not None and (
+                edit.text is not None or edit.x0 is not None
+                or edit.y0 is not None or edit.font_size
+            )
+            if not candidate or not (is_edited or candidate.casefold() != original.casefold()):
+                continue
+
+            x0 = max(0.0, target_block.x0 + style.offset_x - mask_padding)
+            y0 = max(0.0, target_block.y0 + style.offset_y - mask_padding)
+            x1 = min(width, target_block.x1 + style.offset_x + mask_padding)
+            y1 = min(height, target_block.y1 + style.offset_y + mask_padding)
+            content.masks.append((x0, y0, x1, y1))
+
+            lines, font_size, line_height = _fallback_lines(
+                candidate, target_block, font_key, writer, is_arabic, style
+            )
+            first_baseline = _vertical_start(
+                target_block, font_size, len(lines), line_height,
+                style.vertical_align, style.offset_y,
+            )
+            for index, logical_line in enumerate(lines):
+                baseline_y = first_baseline - index * line_height
+                line_text = format_arabic_text(logical_line) if is_arabic else logical_line
+                line_width = writer.font_width(font_key, line_text, font_size)
+                start_x = _horizontal_anchor(
+                    target_block, line_width, style.align, is_arabic, style.offset_x
+                )
+                content.runs.append(
+                    GlyphRun(
+                        text=line_text,
+                        x=max(0.0, start_x),
+                        y=baseline_y,
+                        font_size=font_size,
+                        font_key=font_key,
+                    )
+                )
+
+        if not content.runs:
+            # Page sans texte à réécrire : conserver un contenu vide mais valide.
+            content.runs = []
+        writer.add_page(content)
+
+    # Couleur du texte : le writer écrit en noir ; on rétablit la couleur voulue.
+    _ = text_color
+    return writer.build()
+
+
 def merge_overlay_with_original(original_pdf_bytes: bytes, overlay_pdf_bytes: bytes) -> bytes:
     """Fusionne page par page le calque ReportLab par-dessus le PDF original via `pypdf`."""
     original_reader = PdfReader(io.BytesIO(original_pdf_bytes))

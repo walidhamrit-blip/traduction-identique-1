@@ -659,3 +659,125 @@ def test_platform_defaults_differ_on_vercel(monkeypatch) -> None:
     assert reloaded.TRANSLATE_TIME_BUDGET_S >= 60
     monkeypatch.delenv("VERCEL", raising=False)
     importlib.reload(config_module)
+
+
+# ---------------------------------------------------------------------------
+# Robustesse du rendu : un PDF ne doit plus jamais échouer à cause des `assert`
+# internes de ReportLab (erreur `pdf_processing_failed` / AssertionError en prod).
+# ---------------------------------------------------------------------------
+
+
+def test_pdf_writer_produces_valid_pdf_with_embedded_font(tmp_path) -> None:
+    """Le moteur PDF interne écrit un fichier lisible, avec police embarquée et texte."""
+    import pymupdf
+
+    from app.pdf_writer import GlyphRun, PageContent, PdfWriter
+
+    from pathlib import Path as _Path
+
+    writer = PdfWriter()
+    writer.register_font("f", _Path("assets/fonts/Amiri-Regular.ttf"))
+    page = PageContent(width=595, height=842)
+    page.masks.append((40.0, 700.0, 400.0, 730.0))
+    page.runs.append(GlyphRun(text="فاتورة", x=200.0, y=712.0, font_size=14.0, font_key="f"))
+    writer.add_page(page)
+    data = writer.build()
+
+    assert data.startswith(b"%PDF-")
+    path = tmp_path / "out.pdf"
+    path.write_bytes(data)
+    document = pymupdf.open(path)
+    try:
+        assert document.page_count == 1
+        # Le texte est restitué dans l'ordre logique (RTL) grâce à /ToUnicode.
+        assert document[0].get_text().replace("\n", "") != ""
+        assert "فاتورة" in document[0].get_text() or "ﺓﺭﻭﺕﺍﻑ" in document[0].get_text()
+        assert any("Amiri" in font[3] for font in document[0].get_fonts())
+    finally:
+        document.close()
+
+
+def test_pdf_writer_handles_degenerate_page_size() -> None:
+    """Une page minuscule ou nulle ne doit pas produire un PDF vide/cassé."""
+    from app.pdf_writer import PageContent, PdfWriter
+
+    writer = PdfWriter()
+    writer.add_page(PageContent(width=0.0, height=0.0))
+    data = writer.build()
+    assert data.startswith(b"%PDF-")
+    assert len(data) > 200
+    assert b"%%EOF" in data[-2048:]
+
+
+def test_render_falls_back_when_reportlab_fails(monkeypatch) -> None:
+    """Si ReportLab lève une AssertionError, le PDF est quand même produit."""
+    import app.pipeline as pipeline
+    from app.schemas import TargetLang
+
+    def boom(**_: object) -> bytes:
+        raise AssertionError()
+
+    monkeypatch.setattr(pipeline, "build_overlay_pdf", boom)
+    report = pipeline.PipelineReport()
+    output = pipeline.translate_pdf_bytes(
+        generate_sample_pdf(), TargetLang.FR, report=report
+    )
+
+    assert output.startswith(b"%PDF-")
+    assert b"%%EOF" in output[-2048:]
+    assert report.warnings
+    assert any("secours" in warning for warning in report.warnings)
+
+
+def test_render_falls_back_to_pymupdf_merge(monkeypatch) -> None:
+    """Si la fusion pypdf échoue aussi, PyMuPDF prend le relais."""
+    import app.pipeline as pipeline
+    from app.schemas import TargetLang
+
+    monkeypatch.setattr(
+        pipeline, "merge_overlay_with_original", lambda *a, **k: (_ for _ in ()).throw(AssertionError())
+    )
+    output = pipeline.translate_pdf_bytes(generate_sample_pdf(), TargetLang.FR)
+
+    assert output.startswith(b"%PDF-")
+    assert b"%%EOF" in output[-2048:]
+    import pymupdf
+
+    document = pymupdf.open(stream=output, filetype="pdf")
+    try:
+        assert document.page_count >= 1
+    finally:
+        document.close()
+
+
+def test_render_failure_raises_clear_error_when_every_engine_fails(monkeypatch) -> None:
+    """En dernier recours, le message d'erreur explique quoi faire (export TXT/DOCX)."""
+    import app.pipeline as pipeline
+    from app.errors import PdfProcessingError
+    from app.schemas import TargetLang
+
+    def boom(**_: object) -> bytes:
+        raise AssertionError()
+
+    monkeypatch.setattr(pipeline, "build_overlay_pdf", boom)
+    monkeypatch.setattr(pipeline, "build_overlay_pdf_fallback", boom)
+
+    with pytest.raises(PdfProcessingError) as excinfo:
+        pipeline.translate_pdf_bytes(generate_sample_pdf(), TargetLang.FR)
+    assert "TXT" in (excinfo.value.hint or "")
+
+
+def test_compress_pdf_never_returns_empty_or_truncated_pdf() -> None:
+    from app.exporters import compress_pdf
+
+    assert compress_pdf(b"") == b""
+    broken = b"%PDF-1.4\n1 0 obj<</Type/Catalog>>endobj\ntrailer<</Root 1 0 R>>\n%%EOF"
+    assert compress_pdf(broken) == broken  # illisible -> renvoyé tel quel, pas vidé
+
+
+def test_diag_exposes_render_selftest() -> None:
+    """`/api/diag` indique quel moteur de rendu fonctionne réellement en production."""
+    payload = client.get("/api/diag").json()
+    selftest = payload["render"]
+    assert selftest["reportlab"]["ok"] is True
+    assert selftest["interne"]["ok"] is True
