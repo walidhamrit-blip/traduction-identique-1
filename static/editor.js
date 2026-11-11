@@ -54,6 +54,15 @@ function describeError(payload, httpStatus) {
     return parts.join(" ");
   }
   if (typeof detail === "string") return detail;
+  // La plateforme (Vercel) refuse les gros fichiers AVANT d'atteindre le service :
+  // sa réponse n'est pas du JSON, il faut donc expliquer le 413 nous-mêmes.
+  if (httpStatus === 413) {
+    return (
+      "Fichier trop volumineux : la limite est de 4,5 Mo pour un envoi. " +
+      "Réduisez le poids du document (scan 150 dpi, noir et blanc) ou découpez-le " +
+      "en plusieurs PDF de moins de 4 Mo."
+    );
+  }
   return "Erreur HTTP " + httpStatus;
 }
 
@@ -283,9 +292,23 @@ $("resetBlock").addEventListener("click", () => {
 });
 
 /* --------------------------------------------------------- import fichier */
+const MAX_UPLOAD_BYTES = 4.5 * 1024 * 1024; // limite d'envoi de la plateforme
+
 $("fileInput").addEventListener("change", (event) => {
   const file = event.target.files[0];
   if (!file) return;
+  if (file.size > MAX_UPLOAD_BYTES) {
+    state.file = null;
+    event.target.value = "";
+    showStatus(
+      `Fichier trop volumineux : ${(file.size / (1024 * 1024)).toFixed(1)} Mo pour ` +
+        "une limite de 4,5 Mo. Scannez en 150 dpi noir et blanc, ou découpez le PDF " +
+        "en plusieurs fichiers de moins de 4 Mo.",
+      "err",
+      true
+    );
+    return;
+  }
   state.file = file;
   state.filename = file.name;
   state.edits.clear();

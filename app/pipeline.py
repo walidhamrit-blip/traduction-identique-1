@@ -10,7 +10,7 @@ import unicodedata
 from dataclasses import dataclass
 
 from app.config import SOURCE_LANG, TRANSLATE_ENABLED, TRANSLATE_TIME_BUDGET_S
-from app.errors import PdfProcessingError, PdfServiceError
+from app.errors import PdfProcessingError, PdfServiceError, ScannedPdfError
 from app.extractor import extract_pdf_layout
 from app.renderer import (
     build_overlay_pdf,
@@ -104,6 +104,22 @@ def _original_page_boxes(pdf_bytes: bytes) -> list[tuple[float, float]]:
         return boxes
     except Exception:
         return []
+
+
+def page_has_image(pdf_bytes: bytes, page_index: int) -> bool:
+    """Indique si une page contient au moins une image (utile pour distinguer un scan)."""
+    try:
+        import pymupdf
+
+        document = pymupdf.open(stream=pdf_bytes, filetype="pdf")
+        try:
+            if 0 <= page_index < document.page_count:
+                return bool(document[page_index].get_images(full=True))
+            return False
+        finally:
+            document.close()
+    except Exception:  # pragma: no cover - PyMuPDF absent
+        return False
 
 
 def _apply_edits(
@@ -248,11 +264,22 @@ def translate_pdf_bytes(
 
     total_blocks = sum(len(page.blocks) for page in pages)
     if total_blocks == 0:
-        logger.info("PDF sans texte extractible (scan/image) : original renvoyé tel quel.")
-        if report is not None:
-            report.pages = len(pages)
-            report.warnings = ["PDF sans texte extractible (probablement un scan) : rien à traduire."]
-        return pdf_bytes
+        pages_with_images = sum(1 for page in pages if page_has_image(pdf_bytes, page.page_index))
+        logger.info(
+            "PDF sans texte extractible (%s page(s) image) : rien à traduire.",
+            pages_with_images,
+        )
+        raise ScannedPdfError(
+            "Ce document ne contient aucun texte : c'est une image (document numérisé), "
+            "il n'y a donc rien à traduire automatiquement.",
+            hint=(
+                "Le service traduit le texte d'un PDF, il ne « lit » pas les images. "
+                "Faites d'abord une reconnaissance de caractères (OCR) : dans Adobe "
+                "Acrobat, « Numérisation et OCR » ; ou rescannez avec l'option OCR de "
+                "votre scanner. Une fois le PDF OCRisé (texte sélectionnable), "
+                "renvoyez-le ici : la traduction fonctionnera normalement."
+            ),
+        )
 
     chain = TranslationChain()
     if TRANSLATE_ENABLED:
