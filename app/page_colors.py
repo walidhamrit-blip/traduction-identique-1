@@ -38,18 +38,29 @@ INK_DISTANCE_MIN = 50.0
 BACKGROUND_SHARE_MIN = 0.45
 # Quantification des couleurs pour l'histogramme (tolérance aux dégradés légers).
 COLOR_BUCKET = 12
+# Reconstruction du fond : taille minimale d'une bande et tolérance de variation.
+MIN_BAND_PIXELS = 2
+BAND_FLATNESS = 26.0  # écart max admis entre deux pixels d'une même bande
+BACKGROUND_LEVELS = 14  # nombre de paliers testés pour séparer la bande du fond
 
 
 @dataclass(frozen=True)
 class BlockColors:
-    """Couleurs observées pour un bloc : fond de la zone et encre d'origine."""
+    """Couleurs observées pour un bloc : fond, encre d'origine et bandes de fond.
+
+    ``background`` est la couleur dominante (cas simple : cellule uniforme).
+    ``bands`` décrit le fond **réellement reconstruit** quand la zone n'est pas
+    uniforme : chaque bande est ``(x0, y0, x1, y1, couleur)`` dans le repère PDF.
+    C'est ce qui évite un masque blanc quand un texte déborde de sa cellule colorée.
+    """
 
     background: tuple[float, float, float] | None = None
     ink: tuple[float, float, float] | None = None
+    bands: tuple[tuple[float, float, float, float, tuple[float, float, float]], ...] = ()
 
     @property
     def has_background(self) -> bool:
-        return self.background is not None
+        return self.background is not None or bool(self.bands)
 
 
 def _clamp(value: float) -> float:
@@ -120,34 +131,91 @@ class PageAnalysis:
                 total += 1
         return buckets, total
 
-    def analyze(self, rect: tuple[float, float, float, float]) -> BlockColors:
-        """Couleur dominante du fond et couleur d'encre du texte d'origine.
+    def _region(self, x0: float, x1: float) -> tuple[int, int]:
+        """Indices de colonnes de pixels pour un intervalle horizontal en points."""
+        left = max(0, int(x0 * self._scale))
+        right = min(self._pixmap.width, int(round(x1 * self._scale)))
+        return left, max(left + 1, right)
 
-        La couleur **dominante** d'une zone élargie autour du bloc est le fond
-        (une cellule est majoritairement de la couleur de son fond). L'encre est
-        ensuite la couleur la plus **éloignée** de ce fond parmi les pixels du bloc :
-        cela fonctionne aussi bien pour du texte noir sur fond blanc que pour du
-        texte blanc sur un bandeau gris foncé.
+    def replot(self, rect: tuple[float, float, float, float]) -> tuple[tuple, ...]:
+        """Reconstruit le fond d'une zone non uniforme, par découpage adaptatif.
+
+        Une cellule uniforme donne une seule bande. Quand le texte déborde de la
+        partie colorée, la zone contient deux fonds : le découpage les sépare et
+        chaque morceau reprend sa propre couleur. On ne peint ainsi jamais un
+        rectangle blanc sur une bande colorée.
         """
+        left, top, right, bottom = self._to_pixels(rect)
+        runs: list[tuple[int, int, tuple[int, int, int]]] = []
+        start = left
+        current = self._column_uniform(left, top, right, bottom)
+        for px in range(left + 1, right):
+            color = self._column_uniform(px, top, right, bottom)
+            if color is None or current is None or _distance(color, current) > BAND_FLATNESS:
+                if current is not None and px - start >= MIN_BAND_PIXELS:
+                    runs.append((start, px, current))
+                start = px
+                current = color
+        if current is not None and right - start >= MIN_BAND_PIXELS:
+            runs.append((start, right, current))
+        if not runs:
+            return ()
+
+        height_pt = self._page_height_pt
+        scale = self._scale
+        bands: list[tuple] = []
+        for start_px, end_px, color in runs:
+            bands.append(
+                (
+                    start_px / scale,
+                    height_pt - bottom / scale,
+                    end_px / scale,
+                    height_pt - top / scale,
+                    _to_unit(color),
+                )
+            )
+        return tuple(bands)
+
+    def _column_uniform(
+        self, px: int, top: int, right: int, bottom: int
+    ) -> tuple[int, int, int] | None:
+        """Couleur de fond d'une colonne de pixels (None si elle n'est pas homogène).
+
+        Le fond d'une colonne est sa couleur la plus représentative ; on la retient
+        si elle couvre l'essentiel de la colonne (le reste étant du texte).
+        """
+        counts: dict[tuple[int, int, int], int] = {}
+        total = 0
+        for py in range(top, bottom):
+            rgb = self._pixel(px, py)
+            key = (
+                rgb[0] // COLOR_BUCKET * COLOR_BUCKET,
+                rgb[1] // COLOR_BUCKET * COLOR_BUCKET,
+                rgb[2] // COLOR_BUCKET * COLOR_BUCKET,
+            )
+            counts[key] = counts.get(key, 0) + 1
+            total += 1
+        if not total:
+            return None
+        key, count = max(counts.items(), key=lambda kv: kv[1])
+        if count / total < 0.25:
+            return None
+        return _average_near(counts, key)
+
+    def analyze(self, rect: tuple[float, float, float, float]) -> BlockColors:
+        """Fond, encre d'origine et bandes de fond d'un bloc de texte."""
         x0, y0, x1, y1 = rect
         margin = BACKGROUND_MARGIN
-        outer_buckets, outer_total = self._histogram(
-            (x0 - margin, y0 - margin, x1 + margin, y1 + margin)
-        )
+        outer = (x0 - margin, y0 - margin, x1 + margin, y1 + margin)
+        outer_buckets, outer_total = self._histogram(outer)
         if outer_total == 0:
             return BlockColors()
 
         background_key, background_count = max(outer_buckets.items(), key=lambda kv: kv[1])
-        if background_count / outer_total < BACKGROUND_SHARE_MIN:
-            # Fond non uniforme (photo, dégradé) : on ne masquera pas.
-            return BlockColors(background=None, ink=None)
-
-        # Couleur moyenne des pixels proches de la dominante (évite une couleur « en escalier »).
         background = _average_near(outer_buckets, background_key)
+        uniform = background_count / outer_total >= BACKGROUND_SHARE_MIN
 
-        # Encre : couleur du bloc la plus éloignée du fond. Le texte est fin, donc
-        # on échantillonne au pixel près et on se contente de quelques occurrences
-        # (mais on ignore les pixels isolés, souvent des artefacts de bordure).
+        # Encre : couleur la plus éloignée du fond dans le bloc (texte fin -> pas fin).
         inner_buckets, inner_total = self._histogram((x0, y0, x1, y1), step=1)
         ink: tuple[int, int, int] | None = None
         best_distance = 0.0
@@ -159,10 +227,23 @@ class PageAnalysis:
                 distance = _distance(key, background_key)
                 if distance > best_distance:
                     best_distance, ink = distance, _average_near(inner_buckets, key)
-        if best_distance < INK_DISTANCE_MIN:
-            ink = None
+        ink_unit = _to_unit(ink) if ink is not None and best_distance >= INK_DISTANCE_MIN else None
 
-        return BlockColors(background=_to_unit(background), ink=_to_unit(ink) if ink else None)
+        if uniform:
+            # Le fond est uniforme mais l'encre peut être plus claire que lui :
+            # c'est un texte BLANC sur fond gris. On le détecte pour la conserver.
+            return BlockColors(
+                background=_to_unit(background),
+                ink=ink_unit or _light_ink(inner_buckets, inner_total, background_key),
+            )
+
+        # Zone non uniforme : on reconstruit le fond réellement visible.
+        bands = self.replot(outer)
+        if not bands:
+            return BlockColors(background=None, ink=ink_unit)
+        if len(bands) == 1:
+            return BlockColors(background=bands[0][4], ink=ink_unit)
+        return BlockColors(background=None, ink=ink_unit, bands=bands)
 
 
 def _distance(a: tuple[int, int, int], b: tuple[int, int, int]) -> float:
@@ -183,6 +264,34 @@ def _average_near(
     if not weights:
         return key
     return (red // weights, green // weights, blue // weights)
+
+
+def _light_ink(
+    buckets: dict[tuple[int, int, int], int],
+    total: int,
+    background_key: tuple[int, int, int],
+) -> tuple[float, float, float] | None:
+    """Détecte un texte clair (blanc) sur un fond plus foncé.
+
+    Sur un bandeau gris, le texte blanc est à peine plus clair que le fond : il ne
+    ressort pas comme « couleur la plus éloignée ». On cherche donc explicitement
+    une couleur sensiblement plus lumineuse que le fond.
+    """
+    if not total:
+        return None
+    background_lum = _luminance(background_key)
+    best: tuple[int, int, int] | None = None
+    best_lum = background_lum
+    minimum = 2 if total < 4000 else max(3, int(total * 0.005))
+    for key, count in buckets.items():
+        if count < minimum:
+            continue
+        lum = _luminance(key)
+        if lum > background_lum + 25 and lum > best_lum:
+            best, best_lum = _average_near(buckets, key), lum
+    if best is None:
+        return None
+    return _to_unit(best)
 
 
 def analyze_pages(
