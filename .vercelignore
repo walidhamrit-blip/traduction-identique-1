@@ -1,0 +1,12 @@
+# Fichiers inutiles au runtime : réduit le bundle de la fonction Vercel
+# (limite de 500 Mo, et surtout temps de démarrage à froid).
+tests/
+samples/
+.git/
+.venv/
+.venv-*/
+**/__pycache__/
+**/*.pyc
+.pytest_cache/
+*.md
+!README.md

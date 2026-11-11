@@ -74,6 +74,36 @@ def export_pdf_to_png_pages(pdf_bytes: bytes, dpi: int = 110, max_pages: int = 1
     return images
 
 
+def compress_pdf(pdf_bytes: bytes, *, compress_streams: bool = True) -> bytes:
+    """Réduit le poids d'un PDF sans perte visuelle visible.
+
+    Utile sur Vercel, où la **réponse** est aussi plafonnée à 4,5 Mo : un PDF
+    traduit peut dépasser cette limite même si l'entrée était petite.
+    """
+    if not compress_streams:
+        return pdf_bytes
+    try:
+        from pypdf import PdfReader, PdfWriter
+    except ImportError:  # pragma: no cover
+        return pdf_bytes
+
+    try:
+        reader = PdfReader(io.BytesIO(pdf_bytes), strict=False)
+        writer = PdfWriter(clone_from=reader)
+        for page in writer.pages:
+            try:
+                page.compress_content_streams()
+            except Exception:
+                continue
+        buffer = io.BytesIO()
+        writer.write(buffer)
+        compressed = buffer.getvalue()
+        # On ne garde la version compressée que si elle est réellement plus légère
+        return compressed if len(compressed) < len(pdf_bytes) else pdf_bytes
+    except Exception:
+        return pdf_bytes
+
+
 def export_text(pages: list[list[tuple[object, str]]], *, include_original: bool = False) -> bytes:
     """Exporte le texte traduit (aligné sur les blocs extraits).
 

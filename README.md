@@ -86,7 +86,14 @@ Configuration associée :
 - `.python-version` → `3.12` (versions Vercel : 3.12 / 3.13 / 3.14).
 - `requirements.txt` → versions **épinglées** (une montée de version majeure de `python-bidi`,
   `pypdf` ou `reportlab` peut casser l'import → 500 au runtime).
-- Limite d'upload par défaut : **4 Mo** (Vercel rejette les corps > 4,5 Mo avant la fonction).
+- `maxDuration: 300` → le plan **Hobby autorise 300 s** par invocation (fluid compute),
+  ce qui laisse le temps à la traduction réseau et aux PDF de plusieurs pages.
+- **Limite de 4,5 Mo sur la requête ET sur la réponse** : au-delà, Vercel renvoie
+  un `413 FUNCTION_PAYLOAD_TOO_LARGE` avant même d'appeler la fonction. Le service :
+  1. refuse en amont les fichiers > 4 Mo avec un message clair ;
+  2. **compresse automatiquement** le PDF de sortie s'il approche 4,5 Mo ;
+  3. renvoie un `413` explicite (avec conseil : découper le PDF ou choisir TXT/DOCX)
+     si le fichier reste trop lourd.
 
 ### Diagnostic des erreurs HTTP 500
 
@@ -208,7 +215,7 @@ Polices proposées par `GET /api/fonts`, formats supportés par `GET /api/format
 
 ---
 
-## Déploiement Render (gratuit, sans carte bancaire)
+## Annexe — Alternative : déploiement Render (gratuit, sans carte bancaire)
 
 Render héberge le service sans plafond de 4,5 Mo et sans configuration exotique.
 Le fichier **`render.yaml`** décrit le service ; il suffit de l'utiliser comme Blueprint.
@@ -256,3 +263,19 @@ supprimez-le et recréez un **Web Service** (ou importez le Blueprint `render.ya
 - **Aucun disque persistant** : le service n'écrit rien sur le disque, tout est
   traité en mémoire — c'est déjà le cas.
 - `healthCheckPath: /api/health` permet à Render de vérifier le service.
+
+---
+
+## Réponse à l'erreur « 413 » / fichiers volumineux sur Vercel
+
+Vercel plafonne le corps **et** la réponse à 4,5 Mo. Trois cas :
+
+| Situation | Comportement du service |
+| --- | --- |
+| Fichier source > 4 Mo | `413 payload_too_large` avec message clair, avant tout traitement |
+| PDF traduit proche de 4,5 Mo | compression automatique des flux (`compress_pdf`) |
+| PDF traduit encore trop lourd | `413` explicite, conseil : découper le PDF, choisir TXT/DOCX, ou passer en Docker |
+
+Pour traiter des documents plus lourds sans changer d'hébergeur, la documentation
+Vercel recommande de contourner la limite (upload direct vers un stockage objet),
+ce qui sort du cadre de ce microservice.
