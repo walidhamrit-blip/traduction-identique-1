@@ -3,8 +3,11 @@
   "framework": "fastapi",
   "functions": {
     "api/index.py": {
-      "maxDuration": 60,
+      "maxDuration": 300,
       "excludeFiles": "{tests/**,samples/**,**/__pycache__/**,**/*.pyc}"
     }
-  }
+  },
+  "regions": [
+    "cdg1"
+  ]
 }

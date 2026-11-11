@@ -594,3 +594,68 @@ def test_style_options_helpers() -> None:
     assert StyleOptions().resolved_font_size(10) == 10  # taille détectée
     assert BlockEdit(block_id="x", text="y").hidden is False
     assert VerticalAlign.MIDDLE.value == "middle"
+
+
+# ---------------------------------------------------------------------------
+# Spécificités Vercel : limites de corps (entrée ET sortie) et durée.
+# ---------------------------------------------------------------------------
+
+
+def test_vercel_body_limit_is_enforced_on_input() -> None:
+    """La limite d'entrée ne doit jamais dépasser celle de Vercel (4,5 Mo)."""
+    import app.config as config_module
+
+    assert config_module.MAX_UPLOAD_BYTES < config_module.VERCEL_BODY_LIMIT_BYTES
+    assert config_module.MAX_RESPONSE_BYTES < config_module.VERCEL_BODY_LIMIT_BYTES
+
+
+def test_oversized_translated_pdf_returns_explicit_error(monkeypatch) -> None:
+    """Un PDF traduit qui dépasserait 4,5 Mo doit produire un 413 explicite, pas un 413 opaque."""
+    import api.index as api_module
+
+    monkeypatch.setattr(api_module, "MAX_RESPONSE_BYTES", 1024)  # 1 Ko pour le test
+    monkeypatch.setattr(api_module, "compress_pdf", lambda data: data)
+
+    out = client.post(
+        "/translate",
+        files={"file": ("a.pdf", generate_sample_pdf(), "application/pdf")},
+        data={"target_lang": "ar"},
+    )
+    assert out.status_code == 413
+    detail = out.json()["detail"]
+    assert detail["code"] == "payload_too_large"
+    assert "4,5 Mo" in detail["message"]
+
+
+def test_pdf_compression_never_makes_file_bigger() -> None:
+    from app.exporters import compress_pdf
+
+    original = generate_sample_pdf()
+    compressed = compress_pdf(original)
+    assert len(compressed) <= len(original)
+    assert compressed.startswith(b"%PDF-")
+
+
+def test_vercel_config_is_valid_and_uses_hobby_max_duration() -> None:
+    import json
+    from pathlib import Path
+
+    config = json.loads(Path("vercel.json").read_text())
+    assert config["framework"] == "fastapi"
+    entry = config["functions"]["api/index.py"]
+    assert entry["maxDuration"] <= 300  # maximum du plan Hobby
+    assert "excludeFiles" in entry
+
+
+def test_platform_defaults_differ_on_vercel(monkeypatch) -> None:
+    """Le budget temps doit être plus généreux sur Vercel (300 s autorisées)."""
+    import importlib
+
+    import app.config as config_module
+
+    monkeypatch.setenv("VERCEL", "1")
+    monkeypatch.delenv("PDF_TRANSLATE_BUDGET_S", raising=False)
+    reloaded = importlib.reload(config_module)
+    assert reloaded.TRANSLATE_TIME_BUDGET_S >= 60
+    monkeypatch.delenv("VERCEL", raising=False)
+    importlib.reload(config_module)

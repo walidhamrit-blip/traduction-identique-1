@@ -21,6 +21,7 @@ from app.arabic_utils import format_arabic_text
 from app.config import (
     MAX_PAGES,
     MAX_UPLOAD_BYTES,
+    MAX_RESPONSE_BYTES,
     MAX_UPLOAD_MB,
     PROJECT_ROOT,
     SERVICE_VERSION,
@@ -43,6 +44,7 @@ from app.schemas import BlockEdit, StyleOptions, TargetLang, TextAlign, Vertical
 from app.converters import SUPPORTED_INPUT_FORMATS, to_pdf
 from app.exporters import (
     SUPPORTED_OUTPUT_FORMATS,
+    compress_pdf,
     export_docx,
     export_pdf_to_png,
     export_text,
@@ -259,6 +261,20 @@ async def _handle_translate_request(
 
     if fmt == "pdf":
         content = translated_pdf
+        # La réponse Vercel est plafonnée à 4,5 Mo : on compresse les flux du PDF
+        # si l'on s'en approche, sinon la plateforme renvoie un 413 opaque.
+        if len(content) > MAX_RESPONSE_BYTES:
+            compressed = compress_pdf(content)
+            if len(compressed) > MAX_RESPONSE_BYTES:
+                raise PayloadTooLargeError(
+                    f"Le PDF traduit pèse {len(compressed) / (1024 * 1024):.1f} Mo, au-delà "
+                    "de la limite de 4,5 Mo d'une réponse Vercel.",
+                    hint=(
+                        "Réduisez le nombre de pages (découpez le PDF), choisissez le format "
+                        "TXT/DOCX, ou hébergez le service sur un serveur classique (Docker)."
+                    ),
+                )
+            content = compressed
     elif fmt == "png":
         content = export_pdf_to_png(translated_pdf)
     else:

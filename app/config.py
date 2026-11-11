@@ -36,12 +36,21 @@ def _env_float(name: str, default: float, *, minimum: float = 0.1) -> float:
 
 
 # ---------------------------------------------------------------------------
+# Plateforme d'exécution
+# ---------------------------------------------------------------------------
+# Vercel définit la variable VERCEL=1 dans ses fonctions.
+IS_VERCEL = (os.getenv("VERCEL") or "").strip() == "1"
+
+# Vercel limite le corps de requête **et de réponse** à 4,5 Mo. On se garde une
+# marge (4 Mo en entrée) pour pouvoir renvoyer un message d'erreur lisible au lieu
+# d'un 413 opaque de la plateforme.
+VERCEL_BODY_LIMIT_BYTES = int(4.5 * 1024 * 1024)
+
+# ---------------------------------------------------------------------------
 # Limites d'entrée
 # ---------------------------------------------------------------------------
-# Vercel rejette les requêtes > 4,5 Mo AVANT d'atteindre la fonction (413).
-# On reste donc à 4 Mo par défaut pour pouvoir renvoyer un message clair.
 MAX_UPLOAD_MB = _env_int("PDF_MAX_UPLOAD_MB", 4, minimum=1)
-MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
+MAX_UPLOAD_BYTES = min(MAX_UPLOAD_MB * 1024 * 1024, VERCEL_BODY_LIMIT_BYTES - 512 * 1024)
 
 # Garde-fou mémoire/CPU : au-delà, l'invocation dépasse 60 s ou 1 Go de RAM.
 MAX_PAGES = _env_int("PDF_MAX_PAGES", 40, minimum=1)
@@ -72,8 +81,15 @@ TRANSLATE_ENABLED = (os.getenv("PDF_TRANSLATE", "1") or "1").strip().lower() not
 )
 
 # Budget temps : au-delà, le pipeline cesse d'appeler le réseau et assemble ce
-# qui est déjà traduit (Vercel coupe la fonction à 60 s).
-TRANSLATE_TIME_BUDGET_S = _env_float("PDF_TRANSLATE_BUDGET_S", 35.0, minimum=5.0)
+# qui est déjà traduit. La valeur par défaut s'adapte à la plateforme :
+# - Vercel Hobby autorise 300 s par invocation (fluide compute) ;
+# - en local/Docker, on reste prudent.
+TRANSLATE_TIME_BUDGET_S = _env_float(
+    "PDF_TRANSLATE_BUDGET_S", 90.0 if IS_VERCEL else 35.0, minimum=5.0
+)
+
+# Marge de sécurité sous la limite Vercel de 4,5 Mo sur la réponse.
+MAX_RESPONSE_BYTES = VERCEL_BODY_LIMIT_BYTES - 256 * 1024
 
 # Langues cibles supportées par les fournisseurs gratuits
 SUPPORTED_SOURCE_LANGS = ("auto", "tr", "en", "fr", "ar", "es", "de", "it", "ru", "zh", "nl")
