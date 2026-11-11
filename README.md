@@ -129,6 +129,7 @@ Toutes les erreurs sont désormais renvoyées en JSON structuré — plus aucun 
 | 400 | `empty_pdf` | Fichier vide / aucune page |
 | 413 | `payload_too_large` | Fichier > `PDF_MAX_UPLOAD_MB` (ou > 4,5 Mo sur Vercel) |
 | 413 | `too_many_pages` | Plus de `PDF_MAX_PAGES` pages |
+| 422 | `scanned_pdf_no_text` | Document numérisé (image) : aucune couche de texte, à passer à l'OCR |
 | 422 | `pdf_processing_failed` | Rendu/fusion impossible (PDF exotique) |
 | 503 | `font_unavailable` | `assets/fonts/*.ttf` absent du bundle déployé |
 
@@ -141,6 +142,38 @@ Toutes les erreurs sont désormais renvoyées en JSON structuré — plus aucun 
   }
 }
 ```
+
+### Documents numérisés (scans) et limite de 4,5 Mo
+
+Un scan est un **PDF fait d'images** : il pèse vite 5 à 30 Mo, donc la plateforme
+Vercel le refuse *avant* d'atteindre le service (erreur **413**).
+
+Trois changements :
+
+1. **Message explicite.** Un 413 renvoie désormais un JSON lisible
+   (`payload_too_large`) qui cite la limite réelle et une solution concrète
+   (« scannez en 150 dpi noir et blanc, ou découpez le PDF »). L'interface web
+   affiche le même conseil **avant** l'envoi, dès qu'un fichier dépasse 4,5 Mo.
+2. **Allègement automatique.** Entre la marge interne et 4,5 Mo, le PDF est
+   ré-encodé (`shrink_pdf`) : les pages **sans texte** sont rastérisées en JPEG à
+   150 dpi (elles restent parfaitement lisibles), les pages contenant du texte sont
+   recopiées telles quelles. Mesure : un scan de 33 Mo tombe à 0,6 Mo en moins
+   d'une seconde. La sortie est aussi allégée si elle approche la limite.
+3. **Plus de faux succès.** Un scan sans couche texte ne peut pas être traduit :
+   le service répond `422 scanned_pdf_no_text` avec la marche à suivre (OCR) au
+   lieu de renvoyer silencieusement l'original inchangé.
+
+> Le service **ne fait pas d'OCR** : il traduit le texte présent dans le PDF.
+> Pour un document numérisé, passez-le d'abord dans un OCR (Acrobat →
+> « Numérisation et OCR », ou l'option OCR du scanner), puis envoyez le PDF obtenu.
+
+Réglages associés (variables d'environnement) :
+
+| Variable | Défaut | Rôle |
+| --- | --- | --- |
+| `PDF_IMAGE_OPTIMIZE` | `1` | Active l'allègement automatique des PDF trop lourds |
+| `PDF_IMAGE_TARGET_MB` | `2.6` | Poids visé après allègement |
+| `PDF_IMAGE_MAX_DPI` | `150` | Résolution maximale du ré-encodage des pages scannées |
 
 ### Variables d'environnement (optionnelles)
 

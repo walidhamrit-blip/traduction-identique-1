@@ -781,3 +781,138 @@ def test_diag_exposes_render_selftest() -> None:
     selftest = payload["render"]
     assert selftest["reportlab"]["ok"] is True
     assert selftest["interne"]["ok"] is True
+
+
+# ---------------------------------------------------------------------------
+# Documents numérisés (scans) : la limite de 4,5 Mo de Vercel renvoyait un 413
+# opaque, et un scan sans OCR était « traduit » en renvoyant l'original inchangé.
+# ---------------------------------------------------------------------------
+
+
+def _make_scanned_pdf(pages: int = 1, size: tuple[int, int] = (900, 1200)) -> bytes:
+    """Fabrique un PDF « numérisé » : une image bruitée par page, aucun texte."""
+    import random
+
+    import pymupdf
+
+    rng = random.Random(7)
+    width, height = size
+    document = pymupdf.open()
+    for _ in range(pages):
+        page = document.new_page(width=595, height=842)
+        samples = rng.randbytes(width * height * 3)  # bruit -> incompressible
+        pixmap = pymupdf.Pixmap(pymupdf.csRGB, width, height, samples, False)
+        page.insert_image(page.rect, pixmap=pixmap)
+    return document.tobytes(deflate=True, garbage=1)
+
+
+def test_scanned_pdf_returns_explicit_error_instead_of_fake_success() -> None:
+    """Un scan sans OCR doit renvoyer 422 + conseil OCR, pas l'original inchangé."""
+    scanned = _make_scanned_pdf()
+    response = client.post(
+        "/translate",
+        files={"file": ("scan.pdf", scanned, "application/pdf")},
+        data={"target_lang": "fr"},
+    )
+    assert response.status_code == 422
+    detail = response.json()["detail"]
+    assert detail["code"] == "scanned_pdf_no_text"
+    assert "OCR" in detail["hint"]
+
+
+def test_preview_on_scanned_pdf_is_explicit_too() -> None:
+    scanned = _make_scanned_pdf()
+    response = client.post(
+        "/preview",
+        files={"file": ("scan.pdf", scanned, "application/pdf")},
+        data={"target_lang": "fr", "page": "1"},
+    )
+    assert response.status_code == 422
+    assert response.json()["detail"]["code"] == "scanned_pdf_no_text"
+
+
+def test_shrink_pdf_brings_a_heavy_scan_under_the_limit() -> None:
+    """Un scan trop lourd est ré-encodé jusqu'à passer sous le budget demandé."""
+    import pymupdf
+
+    from app.exporters import shrink_pdf
+
+    scanned = _make_scanned_pdf()
+    target = max(40_000, len(scanned) // 8)
+    shrunk = shrink_pdf(scanned, target_bytes=target)
+
+    assert shrunk.startswith(b"%PDF-")
+    assert len(shrunk) < len(scanned)
+    document = pymupdf.open(stream=shrunk, filetype="pdf")
+    try:
+        assert document.page_count == 1
+        assert document[0].get_pixmap(dpi=40).width > 0  # la page reste rendue
+    finally:
+        document.close()
+
+
+def test_shrink_pdf_keeps_text_documents_as_text() -> None:
+    """Un PDF contenant du texte ne doit jamais être transformé en image."""
+    import pymupdf
+
+    from app.exporters import shrink_pdf
+
+    original = generate_sample_pdf()
+    shrunk = shrink_pdf(original, target_bytes=10_000)
+
+    document = pymupdf.open(stream=shrunk, filetype="pdf")
+    try:
+        assert document[0].get_text().strip(), "le texte doit rester extractible"
+    finally:
+        document.close()
+
+
+def test_upload_too_large_explains_the_platform_limit() -> None:
+    """413 : le message doit citer la limite réelle et une solution concrète."""
+    from app.config import MAX_UPLOAD_BYTES
+
+    oversized = (b"%PDF-1.4\n" + b"0" * (MAX_UPLOAD_BYTES + 1024))
+    response = client.post(
+        "/translate",
+        files={"file": ("enorme.pdf", oversized, "application/pdf")},
+        data={"target_lang": "fr"},
+    )
+    assert response.status_code == 413
+    detail = response.json()["detail"]
+    assert detail["code"] == "payload_too_large"
+    assert "4,5 Mo" in detail["hint"]
+
+
+def test_oversized_but_accepted_pdf_is_optimized_before_processing(monkeypatch) -> None:
+    """Entre notre marge et 4,5 Mo, le PDF est allégé automatiquement."""
+    import asyncio
+    import io
+
+    from starlette.datastructures import UploadFile
+
+    import api.index as api_index
+    from app.exporters import shrink_pdf
+
+    from app.config import MAX_UPLOAD_BYTES
+
+    scanned = _make_scanned_pdf()
+    smaller = shrink_pdf(scanned, target_bytes=20_000)
+    assert len(smaller) < len(scanned)
+
+    called: dict[str, int] = {}
+
+    def fake_shrink(data: bytes, *, target_bytes: int) -> bytes:
+        called["target"] = target_bytes
+        return smaller
+
+    monkeypatch.setattr("app.exporters.shrink_pdf", fake_shrink)
+
+    # La conversion renvoie un PDF plus lourd que la limite : c'est lui qui doit
+    # être allégé, l'envoi brut restant sous la limite.
+    monkeypatch.setattr(
+        api_index, "to_pdf", lambda name, content: (content + scanned, "pdf", [])
+    )
+    upload = UploadFile(filename="scan.pdf", file=io.BytesIO(scanned))
+    data, _fmt = asyncio.run(api_index._read_upload(upload))
+    assert data == smaller
+    assert "target" in called

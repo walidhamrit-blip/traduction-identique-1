@@ -14,6 +14,14 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
+def _env_flag(name: str, default: bool = True) -> bool:
+    """Lit un booléen d'environnement ("1/0", "true/false", "oui/non"...)."""
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    return raw.strip().lower() not in ("0", "false", "no", "non", "off")
+
+
 def _env_int(name: str, default: int, *, minimum: int = 1) -> int:
     """Lit un entier depuis l'environnement en ignorant les valeurs invalides."""
     raw = os.getenv(name)
@@ -51,6 +59,21 @@ VERCEL_BODY_LIMIT_BYTES = int(4.5 * 1024 * 1024)
 # ---------------------------------------------------------------------------
 MAX_UPLOAD_MB = _env_int("PDF_MAX_UPLOAD_MB", 4, minimum=1)
 MAX_UPLOAD_BYTES = min(MAX_UPLOAD_MB * 1024 * 1024, VERCEL_BODY_LIMIT_BYTES - 512 * 1024)
+
+# Budget réel d'une requête multipart : 4,5 Mo côté plateforme **moins** l'enveloppe
+# multipart (frontières, en-têtes, champs de formulaire) et une marge de sécurité.
+# Sans cela, un fichier de 4,0 Mo est refusé par Vercel avant même d'arriver au code.
+MULTIPART_OVERHEAD_BYTES = int(0.25 * 1024 * 1024)
+SAFE_REQUEST_BYTES = VERCEL_BODY_LIMIT_BYTES - MULTIPART_OVERHEAD_BYTES
+
+# Un PDF « numérisé » (scan) est souvent une grosse image JPEG : on ré-encode les
+# images trop lourdes pour retomber sous les limites de taille, en qualité dégradée
+# (le document reste lisible).
+IMAGE_OPTIMIZE_ENABLED = _env_flag("PDF_IMAGE_OPTIMIZE", True)
+IMAGE_OPTIMIZE_TARGET_BYTES = int(
+    float(os.getenv("PDF_IMAGE_TARGET_MB", "2.6")) * 1024 * 1024
+)
+IMAGE_OPTIMIZE_MAX_DPI = _env_int("PDF_IMAGE_MAX_DPI", 150, minimum=72)
 
 # Garde-fou mémoire/CPU : au-delà, l'invocation dépasse 60 s ou 1 Go de RAM.
 MAX_PAGES = _env_int("PDF_MAX_PAGES", 40, minimum=1)

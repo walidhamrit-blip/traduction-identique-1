@@ -207,3 +207,92 @@ def export(filename: str | None, fmt: str) -> str:
     stem = safe_ascii_stem(filename)
     extension = {"pdf": "pdf", "png": "png", "txt": "txt", "docx": "docx"}.get(fmt, "pdf")
     return f"{stem}_traduit.{extension}"
+
+
+def _page_has_text(page) -> bool:
+    """Vrai si la page contient du texte extractible (donc pas un simple scan)."""
+    try:
+        return len(page.get_text("text").strip()) > 0
+    except Exception:  # pragma: no cover - page illisible
+        return True  # prudence : on ne rastérise pas
+
+
+def _optimize_with_pymupdf(pdf_bytes: bytes, dpi: int) -> bytes:
+    """Réduit le poids en ré-encodant les pages **scannées** (sans texte) en JPEG.
+
+    Les pages qui contiennent du texte sont recopiées telles quelles : on ne
+    transforme jamais un document texte en image (on perdrait le texte).
+    """
+    import pymupdf
+
+    source = pymupdf.open(stream=pdf_bytes, filetype="pdf")
+    try:
+        output = pymupdf.open()
+        for page in source:
+            rect = page.rect
+            if _page_has_text(page):
+                output.new_page(width=rect.width, height=rect.height)
+                output[-1].show_pdf_page(rect, source, page.number)
+                continue
+            pix = page.get_pixmap(dpi=dpi)
+            target = output.new_page(width=rect.width, height=rect.height)
+            target.insert_image(
+                rect,
+                stream=pix.tobytes("jpeg", jpg_quality=72),
+                keep_proportion=False,
+            )
+        result = output.tobytes(garbage=4, deflate=True, clean=True)
+        output.close()
+        return result
+    finally:
+        source.close()
+
+
+def _optimize_with_pypdf(pdf_bytes: bytes) -> bytes:
+    """Repli d'optimisation : compression des flux via pypdf uniquement."""
+    from pypdf import PdfReader, PdfWriter
+
+    reader = PdfReader(io.BytesIO(pdf_bytes), strict=False)
+    writer = PdfWriter(clone_from=reader)
+    for page in writer.pages:
+        try:
+            page.compress_content_streams()
+        except Exception:  # noqa: BLE001
+            continue
+    buffer = io.BytesIO()
+    writer.write(buffer)
+    return buffer.getvalue()
+
+
+def shrink_pdf(pdf_bytes: bytes, *, target_bytes: int) -> bytes:
+    """Réduit un PDF trop volumineux (typiquement un scan) sous `target_bytes`.
+
+    Utilisé pour les **documents numérisés** : une page scannée pèse souvent 1 à 5 Mo
+    à elle seule, ce qui fait dépasser la limite de 4,5 Mo de Vercel (erreur 413).
+    On ré-encode les images en JPEG avec une échelle décroissante jusqu'à rentrer
+    dans le budget. Si aucune passe ne suffit, le plus petit résultat est renvoyé :
+    l'appelant décide alors quoi faire.
+    """
+    if not pdf_bytes or len(pdf_bytes) <= target_bytes:
+        return pdf_bytes
+
+    best = pdf_bytes
+    from app.config import IMAGE_OPTIMIZE_MAX_DPI
+
+    max_dpi = max(72, IMAGE_OPTIMIZE_MAX_DPI)
+    # DPI de plus en plus bas : un scan A4 à 150 dpi reste parfaitement lisible.
+    for dpi in (max_dpi, int(max_dpi * 0.8), int(max_dpi * 0.6), 72):
+        try:
+            candidate = _optimize_with_pymupdf(best, dpi)
+        except Exception as exc:  # noqa: BLE001 - PyMuPDF absent/erreur : repli pypdf
+            logger.info("Optimisation PyMuPDF indisponible (%s)", type(exc).__name__)
+            try:
+                candidate = _optimize_with_pypdf(best)
+            except Exception:  # noqa: BLE001
+                return best
+        if not _looks_like_pdf(candidate) or len(candidate) >= len(best):
+            continue
+        best = candidate
+        if len(best) <= target_bytes:
+            return best
+    return best

@@ -109,3 +109,22 @@ class PdfProcessingError(PdfServiceError):
         "Le PDF contient probablement une structure non prise en charge. "
         "Consultez /api/diag et les logs de la fonction pour le détail."
     )
+
+
+class ScannedPdfError(PdfServiceError):
+    """PDF sans aucune couche de texte (document numérisé) : il n'y a rien à traduire.
+
+    Répondre par une erreur explicite est volontaire : renvoyer l'original inchangé
+    laissait croire à une traduction réussie alors que le document restait illisible
+    pour un lecteur de la langue cible.
+    """
+
+    status_code = 422
+    code = "scanned_pdf_no_text"
+    default_hint = (
+        "Ce document est une image (scan) : il ne contient aucun texte "
+        "sélectionnable, donc rien ne peut être traduit automatiquement. "
+        "Deux solutions : passez-le dans un OCR (par exemple « Reconnaissance de "
+        "texte » d'Acrobat, ou un scanner avec OCR), puis envoyez le PDF obtenu ; "
+        "ou exportez le texte (Word/texte) depuis votre traitement de texte."
+    )

@@ -19,6 +19,8 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response
 
 from app.arabic_utils import format_arabic_text
 from app.config import (
+    IMAGE_OPTIMIZE_ENABLED,
+    IMAGE_OPTIMIZE_TARGET_BYTES,
     MAX_PAGES,
     MAX_UPLOAD_BYTES,
     MAX_RESPONSE_BYTES,
@@ -45,6 +47,7 @@ from app.converters import SUPPORTED_INPUT_FORMATS, to_pdf
 from app.exporters import (
     SUPPORTED_OUTPUT_FORMATS,
     compress_pdf,
+    shrink_pdf,
     export_docx,
     export_pdf_to_png,
     export_text,
@@ -103,8 +106,12 @@ async def _unhandled_error_handler(request: Request, exc: Exception) -> JSONResp
     )
 
 
-async def _read_upload(file: UploadFile) -> tuple[bytes, str]:
-    """Lit, valide puis convertit le fichier envoyé en PDF si nécessaire."""
+async def _read_upload(file: UploadFile, *, optimize: bool = True) -> tuple[bytes, str]:
+    """Lit, valide puis convertit le fichier envoyé en PDF si nécessaire.
+
+    `optimize=True` : un PDF trop lourd (document numérisé contenant de grosses
+    images) est allégé avant traitement, plutôt que d'être refusé (erreur 413).
+    """
     content = await file.read()
     if not content:
         raise EmptyPdfError("Le fichier envoyé est vide.")
@@ -112,10 +119,39 @@ async def _read_upload(file: UploadFile) -> tuple[bytes, str]:
     if len(content) > MAX_UPLOAD_BYTES:
         raise PayloadTooLargeError(
             f"Le fichier ({len(content) / (1024 * 1024):.1f} Mo) dépasse la taille "
-            f"maximale autorisée ({MAX_UPLOAD_MB} Mo)."
+            f"maximale autorisée ({MAX_UPLOAD_MB} Mo).",
+            hint=(
+                "Vercel refuse les requêtes de plus de 4,5 Mo (limite de la plateforme), "
+                "quelle que soit la configuration du service. Pour un document numérisé : "
+                "scannez en 150 dpi en noir et blanc, ou découpez le PDF en plusieurs "
+                "fichiers de moins de 4 Mo."
+            ),
         )
 
     pdf_bytes, detected_format, _warnings = to_pdf(file.filename, content)
+
+    if optimize and IMAGE_OPTIMIZE_ENABLED and len(pdf_bytes) > MAX_UPLOAD_BYTES:
+        from app.exporters import shrink_pdf
+
+        shrunk = shrink_pdf(pdf_bytes, target_bytes=IMAGE_OPTIMIZE_TARGET_BYTES)
+        if shrunk and len(shrunk) < len(pdf_bytes):
+            logger.info(
+                "PDF allégé pour rester sous les limites : %.1f Mo -> %.1f Mo",
+                len(pdf_bytes) / (1024 * 1024),
+                len(shrunk) / (1024 * 1024),
+            )
+            pdf_bytes = shrunk
+
+    if len(pdf_bytes) > MAX_UPLOAD_BYTES:
+        raise PayloadTooLargeError(
+            f"Le document reste trop volumineux après compression "
+            f"({len(pdf_bytes) / (1024 * 1024):.1f} Mo, limite {MAX_UPLOAD_MB} Mo).",
+            hint=(
+                "Découpez le PDF en plusieurs fichiers, ou réduisez la qualité des "
+                "images du scan (150 dpi, noir et blanc) avant de l'envoyer."
+            ),
+        )
+
     return pdf_bytes, detected_format
 
 
@@ -261,17 +297,19 @@ async def _handle_translate_request(
 
     if fmt == "pdf":
         content = translated_pdf
-        # La réponse Vercel est plafonnée à 4,5 Mo : on compresse les flux du PDF
-        # si l'on s'en approche, sinon la plateforme renvoie un 413 opaque.
+        # La réponse Vercel est plafonnée à 4,5 Mo : on allège le PDF si l'on s'en
+        # approche, sinon la plateforme renvoie un 413 opaque.
         if len(content) > MAX_RESPONSE_BYTES:
             compressed = compress_pdf(content)
             if len(compressed) > MAX_RESPONSE_BYTES:
+                compressed = shrink_pdf(compressed, target_bytes=MAX_RESPONSE_BYTES)
+            if len(compressed) > MAX_RESPONSE_BYTES:
                 raise PayloadTooLargeError(
                     f"Le PDF traduit pèse {len(compressed) / (1024 * 1024):.1f} Mo, au-delà "
-                    "de la limite de 4,5 Mo d'une réponse Vercel.",
+                    "de la limite de 4,5 Mo d'une réponse Vercel, même après compression.",
                     hint=(
-                        "Réduisez le nombre de pages (découpez le PDF), choisissez le format "
-                        "TXT/DOCX, ou hébergez le service sur un serveur classique (Docker)."
+                        "Découpez le PDF en plusieurs fichiers de quelques pages, ou "
+                        "choisissez l'export TXT/DOCX (bien plus léger)."
                     ),
                 )
             content = compressed
@@ -1010,6 +1048,10 @@ def interactive_console() -> HTMLResponse:
         return parts.join(" ");
       }
       if (typeof detail === "string") return detail;
+      if (httpStatus === 413) {
+        return "Fichier trop volumineux : la limite d'envoi est de 4,5 Mo. " +
+          "Réduisez le poids du document (scan 150 dpi, noir et blanc) ou découpez-le.";
+      }
       return "Erreur HTTP " + httpStatus;
     }
 
@@ -1027,6 +1069,17 @@ def interactive_console() -> HTMLResponse:
 
     pdfInput.addEventListener("change", (e) => {
       const f = e.target.files[0];
+      if (f && f.size > 4.5 * 1024 * 1024) {
+        e.target.value = "";
+        currentPdfBlob = null;
+        setStatus(
+          "Fichier trop volumineux : " + (f.size / (1024 * 1024)).toFixed(1) +
+          " Mo pour une limite de 4,5 Mo. Scannez en 150 dpi noir et blanc, ou " +
+          "découpez le PDF en plusieurs fichiers.",
+          "error"
+        );
+        return;
+      }
       if (f) {
         showOriginalBlob(f, f.name);
         setStatus("Fichier chargé : " + f.name + ". Cliquez sur « Traduire le PDF ».", "info");
