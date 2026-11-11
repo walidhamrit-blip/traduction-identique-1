@@ -74,6 +74,21 @@ def export_pdf_to_png_pages(pdf_bytes: bytes, dpi: int = 110, max_pages: int = 1
     return images
 
 
+def _looks_like_pdf(data: bytes) -> bool:
+    """Vérifie que la sortie commence bien par la signature PDF et se termine par %%EOF."""
+    return bool(data) and data.lstrip()[:5] == b"%PDF-" and b"%%EOF" in data[-2048:]
+
+
+def _page_count(data: bytes) -> int:
+    """Nombre de pages d'un PDF, ou -1 si illisible (utilisé comme garde-fou)."""
+    try:
+        from pypdf import PdfReader
+
+        return len(PdfReader(io.BytesIO(data), strict=False).pages)
+    except Exception:
+        return -1
+
+
 def compress_pdf(pdf_bytes: bytes, *, compress_streams: bool = True) -> bytes:
     """Réduit le poids d'un PDF sans perte visuelle visible.
 
@@ -98,6 +113,11 @@ def compress_pdf(pdf_bytes: bytes, *, compress_streams: bool = True) -> bytes:
         buffer = io.BytesIO()
         writer.write(buffer)
         compressed = buffer.getvalue()
+        # Garde-fou : jamais de PDF vide ou tronqué, même si pypdf « réussit ».
+        if len(compressed) < 1024 or not _looks_like_pdf(compressed):
+            return pdf_bytes
+        if _page_count(compressed) != _page_count(pdf_bytes):
+            return pdf_bytes
         # On ne garde la version compressée que si elle est réellement plus légère
         return compressed if len(compressed) < len(pdf_bytes) else pdf_bytes
     except Exception:

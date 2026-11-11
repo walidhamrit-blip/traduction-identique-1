@@ -633,8 +633,66 @@ def diagnostics() -> JSONResponse:
             )
         ),
         "dependencies": _dependency_versions(),
+        "render": _render_selftest(),
     }
     return JSONResponse(payload)
+
+
+def _minimal_pdf() -> bytes:
+    """Construit un PDF d'une page blanche valide (base de l'auto-test de rendu)."""
+    from app.pdf_writer import PageContent, PdfWriter
+
+    writer = PdfWriter()
+    writer.add_page(PageContent(width=595, height=842))
+    return writer.build()
+
+
+def _render_selftest() -> dict[str, object]:
+    """Auto-test de rendu : reproduit une mini-page PDF et indique le moteur qui répond.
+
+    Permet de vérifier depuis le navigateur (`/api/diag`) si ReportLab fonctionne
+    dans l'environnement déployé, sans avoir à lire les logs Vercel.
+    """
+    from app.renderer import (
+        _select_font_name,
+        build_overlay_pdf,
+        build_overlay_pdf_fallback,
+        merge_overlay_with_original,
+        merge_overlay_with_pymupdf,
+    )
+    from app.schemas import ExtractedPage, TargetLang, TextBlock
+
+    block = TextBlock(
+        text="Invoice 2026", x0=40, y0=700, x1=300, y1=730, font_size=12, line_count=1
+    )
+    page = ExtractedPage(page_index=0, width=595, height=842, blocks=[block])
+    kwargs = {
+        "pages": [page],
+        "translated_blocks_per_page": [[(block, "Facture 2026")]],
+        "target_lang": TargetLang.FR,
+    }
+    result: dict[str, object] = {}
+    for name, render in (
+        ("reportlab", build_overlay_pdf),
+        ("interne", build_overlay_pdf_fallback),
+    ):
+        try:
+            overlay = render(**kwargs)
+            sample = merge_overlay_with_original(_minimal_pdf(), overlay)
+            result[name] = {"ok": True, "overlay_bytes": len(overlay), "merged_bytes": len(sample)}
+        except Exception as exc:  # noqa: BLE001 - diagnostic : on veut l'erreur brute
+            result[name] = {
+                "ok": False,
+                "error": f"{type(exc).__name__}: {exc}",
+                "traceback": __import__("traceback").format_exc(limit=4).splitlines()[-6:],
+            }
+    try:
+        merge_overlay_with_pymupdf(_minimal_pdf(), build_overlay_pdf_fallback(**kwargs))
+        result["merge_pymupdf"] = {"ok": True}
+    except Exception as exc:  # noqa: BLE001
+        result["merge_pymupdf"] = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+    result["font_used"] = _select_font_name(TargetLang.FR)
+    return result
 
 
 def _dependency_versions() -> dict[str, str]:

@@ -95,6 +95,26 @@ Configuration associée :
   3. renvoie un `413` explicite (avec conseil : découper le PDF ou choisir TXT/DOCX)
      si le fichier reste trop lourd.
 
+### Robustesse du rendu (plus de « pdf_processing_failed » sur un PDF valide)
+
+ReportLab contient des `assert` internes (`pdfbase/ttfonts.py`) qui peuvent interrompre
+tout l'export sur un document pourtant lisible. Le rendu passe donc par une chaîne de
+secours : si un moteur échoue, le suivant prend le relais automatiquement.
+
+1. **ReportLab + pypdf** — rendu de référence, style complet (police, taille, couleur,
+   alignement, interligne, décalages).
+2. **Moteur interne + pypdf** — `app/pdf_writer.py`, un écrivain PDF autonome (polices
+   TrueType embarquées, table `/ToUnicode` : le texte reste sélectionnable), sans aucun
+   `assert` tiers. Le style est simplifié, la mise en page et les positions sont
+   conservées. L'utilisateur voit un avertissement explicite.
+3. **Moteur interne + PyMuPDF** — fusion indépendante, si `pypdf` lui-même est en cause.
+4. **Dernier recours** — erreur `pdf_processing_failed` avec un conseil concret
+   (export TXT ou DOCX, qui ne passe pas par le rendu PDF).
+
+`GET /api/diag` inclut désormais un auto-test `render` qui indique, sans lire les logs,
+quel moteur répond réellement dans l'environnement déployé
+(`reportlab`, `interne`, `merge_pymupdf`, `font_used`).
+
 ### Diagnostic des erreurs HTTP 500
 
 `GET /api/diag` renvoie l'environnement d'exécution (chemins, présence des polices TTF,
