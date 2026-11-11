@@ -46,6 +46,7 @@ class GlyphRun:
     y: float  # ordonnée de la ligne de base
     font_size: float
     font_key: str  # clé de police (voir PdfWriter.fonts)
+    color: tuple[float, float, float] = (0.0, 0.0, 0.0)
 
 
 @dataclass
@@ -54,7 +55,8 @@ class PageContent:
 
     width: float
     height: float
-    masks: list[tuple[float, float, float, float]] = field(default_factory=list)
+    # (x0, y0, x1, y1, couleur) ; couleur = None -> blanc
+    masks: list[tuple] = field(default_factory=list)
     runs: list[GlyphRun] = field(default_factory=list)
 
 
@@ -303,18 +305,21 @@ class PdfWriter:
     def _page_stream(self, page: PageContent) -> bytes:
         """Instructions de contenu : masques blancs puis texte positionné."""
         parts: list[bytes] = [b"q"]
-        if page.masks:
-            parts.append(b"1 1 1 rg 1 1 1 RG")
-            for x0, y0, x1, y1 in page.masks:
-                width = max(0.5, x1 - x0)
-                height = max(0.5, y1 - y0)
-                parts.append(f"{x0:.2f} {y0:.2f} {width:.2f} {height:.2f} re f".encode())
+        for mask in page.masks:
+            x0, y0, x1, y1 = mask[0], mask[1], mask[2], mask[3]
+            color = mask[4] if len(mask) > 4 and mask[4] else (1.0, 1.0, 1.0)
+            red, green, blue = color
+            width = max(0.5, x1 - x0)
+            height = max(0.5, y1 - y0)
+            parts.append(f"{red:.4f} {green:.4f} {blue:.4f} rg".encode())
+            parts.append(f"{x0:.2f} {y0:.2f} {width:.2f} {height:.2f} re f".encode())
         parts.append(b"Q")
 
         for run in page.runs:
             if not run.text:
                 continue
-            parts.append(b"q 0 0 0 rg")
+            color = run.color or (0.0, 0.0, 0.0)
+            parts.append(f"q {color[0]:.4f} {color[1]:.4f} {color[2]:.4f} rg".encode())
             parts.append(
                 f"BT /{_pdf_name(self.fonts[run.font_key].key)} {run.font_size:.2f} Tf "
                 f"1 0 0 1 {run.x:.2f} {run.y:.2f} Tm".encode()

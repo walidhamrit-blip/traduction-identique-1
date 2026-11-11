@@ -95,6 +95,30 @@ Configuration associée :
   3. renvoie un `413` explicite (avec conseil : découper le PDF ou choisir TXT/DOCX)
      si le fichier reste trop lourd.
 
+### Mise en forme identique à l'original (fonds de tableau, texte blanc)
+
+Le calque de traduction recouvre le texte d'origine par un rectangle. Ce rectangle
+était peint en **blanc pur**, ce qui laissait des « remplissages blancs » très
+visibles sur les documents à fonds colorés : bandeaux gris, lignes alternées,
+cellules surlignées, texte blanc sur fond sombre.
+
+Le rendu mesure donc désormais les **couleurs réelles** de la page
+(`app/page_colors.py`) :
+
+- **fond** : couleur dominante autour du bloc → le masque reprend exactement cette
+  couleur ; sur un fond non uniforme (photo, dégradé), rien n'est masqué plutôt que
+  de peindre un rectangle visible ;
+- **encre** : couleur la plus éloignée du fond dans le bloc → le texte traduit garde
+  la couleur d'origine (texte blanc sur bandeau gris reste blanc, texte noir sur
+  blanc reste noir).
+
+La couleur choisie dans l'éditeur reste prioritaire si elle diffère du réglage par
+défaut. Coût : un rendu à 100 dpi par page (quelques dizaines de millisecondes).
+
+| Variable | Défaut | Rôle |
+| --- | --- | --- |
+| `PDF_PAGE_COLORS` | `1` | Analyse des couleurs réelles (fond + encre) avant le rendu |
+
 ### Robustesse du rendu (plus de « pdf_processing_failed » sur un PDF valide)
 
 ReportLab contient des `assert` internes (`pdfbase/ttfonts.py`) qui peuvent interrompre

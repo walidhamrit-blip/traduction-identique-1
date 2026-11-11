@@ -75,6 +75,12 @@ IMAGE_OPTIMIZE_TARGET_BYTES = int(
 )
 IMAGE_OPTIMIZE_MAX_DPI = _env_int("PDF_IMAGE_MAX_DPI", 150, minimum=72)
 
+# Analyse des couleurs réelles (fond de cellule, encre d'origine) avant le rendu :
+# sans elle, le masque est peint en blanc et crée des trous visibles sur les
+# tableaux à fonds colorés. Coût : un rendu à 100 dpi par page (quelques dizaines
+# de millisecondes), négligeable devant la traduction.
+PAGE_COLORS_ENABLED = _env_flag("PDF_PAGE_COLORS", True)
+
 # Garde-fou mémoire/CPU : au-delà, l'invocation dépasse 60 s ou 1 Go de RAM.
 MAX_PAGES = _env_int("PDF_MAX_PAGES", 40, minimum=1)
 

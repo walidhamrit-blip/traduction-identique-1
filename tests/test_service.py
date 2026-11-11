@@ -1040,3 +1040,84 @@ def test_reference_import_rejects_unknown_format() -> None:
     )
     assert response.status_code == 415
     assert response.json()["detail"]["code"] == "unsupported_reference_format"
+
+
+# ---------------------------------------------------------------------------
+# Mise en forme identique à l'original : le masque reprend la couleur RÉELLE du
+# fond. Peint en blanc, il laissait des « remplissages blancs » sur les tableaux
+# à fonds gris ou colorés (bandeaux, lignes alternées, texte blanc sur gris).
+# ---------------------------------------------------------------------------
+
+
+def _make_table_with_gray_rows() -> bytes:
+    """Tableau noir sur blanc ET bandeau gris avec texte blanc."""
+    import pymupdf
+
+    document = pymupdf.open()
+    page = document.new_page(width=842, height=595)
+    # Bandeau gris foncé, texte blanc
+    page.draw_rect(pymupdf.Rect(30, 46, 812, 74), color=None, fill=(0.35, 0.35, 0.35))
+    page.insert_text((40, 66), "Item code", fontsize=9, color=(1, 1, 1))
+    page.insert_text((200, 66), "Description", fontsize=9, color=(1, 1, 1))
+    # Ligne blanche, texte noir
+    page.insert_text((40, 110), "SC00601S5003011", fontsize=9, color=(0, 0, 0))
+    page.insert_text((200, 110), "Toilet seat cover, slim, soft close", fontsize=9, color=(0, 0, 0))
+    return document.tobytes(deflate=True, garbage=3)
+
+
+def test_page_analysis_reads_background_and_ink_colors() -> None:
+    """Le fond gris et l'encre blanche doivent être mesurés, pas supposés."""
+    from app.extractor import extract_pdf_layout
+    from app.page_colors import analyze_pages
+
+    pdf = _make_table_with_gray_rows()
+    pages = extract_pdf_layout(pdf)
+    rects = [[(b.x0, b.y0, b.x1, b.y1) for b in page.blocks] for page in pages]
+    colors = analyze_pages(pdf, rects)[0]
+
+    assert colors, "l'analyse doit renvoyer une entrée par bloc"
+    backgrounds = [c.background for c in colors if c.background]
+    assert any(b[0] < 0.6 for b in backgrounds), "le fond gris du bandeau doit être détecté"
+    assert any(
+        c.ink is not None and min(c.ink) > 0.8 for c in colors
+    ), "le texte blanc du bandeau doit être détecté"
+
+
+def test_overlay_masks_use_the_real_background_colour() -> None:
+    """Le masque reprend la couleur du fond : plus de rectangle blanc sur du gris."""
+    import pymupdf
+
+    from app.extractor import extract_pdf_layout
+    from app.pipeline import PipelineReport, translate_pdf_bytes
+    from app.schemas import TargetLang
+
+    pdf = _make_table_with_gray_rows()
+    report = PipelineReport()
+    output = translate_pdf_bytes(pdf, TargetLang.FR, report=report)
+    assert report.translated_blocks >= 1
+
+    document = pymupdf.open(stream=output, filetype="pdf")
+    try:
+        pixmap = document[0].get_pixmap(dpi=100)
+        # Un point du bandeau gris, hors de tout texte : il doit rester gris.
+        scale = pixmap.width / document[0].rect.width
+        sample = pixmap.pixel(int(400 * scale), int(60 * scale))
+        red, green, blue = sample[0], sample[1], sample[2]
+        assert not (red > 240 and green > 240 and blue > 240), (
+            f"le bandeau gris a été repeint en blanc : {sample}"
+        )
+    finally:
+        document.close()
+
+
+def test_masking_can_be_disabled_by_configuration(monkeypatch) -> None:
+    """PDF_PAGE_COLORS=0 désactive l'analyse (compatibilité et tests)."""
+    import importlib
+
+    import app.config as config_module
+
+    monkeypatch.setenv("PDF_PAGE_COLORS", "0")
+    reloaded = importlib.reload(config_module)
+    assert reloaded.PAGE_COLORS_ENABLED is False
+    monkeypatch.delenv("PDF_PAGE_COLORS", raising=False)
+    importlib.reload(config_module)
