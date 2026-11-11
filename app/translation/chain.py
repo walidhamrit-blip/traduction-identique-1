@@ -70,7 +70,15 @@ def build_provider(name: str) -> TranslationProvider | None:
 class TranslationResult:
     """Résultat d'une traduction de page : texte par bloc + statistiques."""
 
-    __slots__ = ("translations", "provider", "degraded", "translated_count", "skipped_count", "errors")
+    __slots__ = (
+        "translations",
+        "provider",
+        "degraded",
+        "translated_count",
+        "skipped_count",
+        "errors",
+        "reference_hits",
+    )
 
     def __init__(self) -> None:
         self.translations: list[str] = []
@@ -79,6 +87,8 @@ class TranslationResult:
         self.translated_count: int = 0
         self.skipped_count: int = 0
         self.errors: list[str] = []
+        # Nombre de segments traduits grâce à la base d'articles (prioritaire).
+        self.reference_hits: int = 0
 
 
 class TranslationChain:
@@ -126,17 +136,26 @@ class TranslationChain:
             result.provider = "skipped"
             return result
 
+        # 1) Base de référence d'articles : la traduction validée par l'entreprise
+        #    prime toujours sur un moteur automatique (référence article = clé).
+        reference_mapping = self._lookup_reference(to_translate, target)
+
         # Déduplication via cache (les libellés répétés ne coûtent rien)
         unique_needed: list[str] = []
         seen: set[str] = set()
         for _, cleaned in to_translate:
             key = (cleaned, source, target)
-            if key in _CACHE or cleaned in seen:
+            if key in _CACHE or cleaned in seen or cleaned in reference_mapping:
                 continue
             seen.add(cleaned)
             unique_needed.append(cleaned)
 
-        fresh = self._translate_with_chain(unique_needed, source, target)
+        fresh = self._translate_with_chain(unique_needed, source, target) if unique_needed else {}
+        fresh = {**reference_mapping, **fresh}
+        if reference_mapping:
+            # Les correspondances de la base ne sont pas du « automatique » : on
+            # garde le nom du moteur utilisé pour le reste, ou « reference » seul.
+            self.used_provider = self.used_provider or "reference"
 
         result.provider = self.used_provider or "offline"
         result.degraded = result.provider == "offline" and bool(unique_needed)
@@ -147,10 +166,44 @@ class TranslationChain:
             translated = _CACHE.get(key) or fresh.get(cleaned) or cleaned
             if translated.strip() and translated.strip() != cleaned:
                 result.translated_count += 1
+                if cleaned in reference_mapping:
+                    result.reference_hits += 1
             else:
                 result.skipped_count += 1
             result.translations[index] = translated
+        result.provider = self.used_provider or result.provider
         return result
+
+    # -- Base de référence -------------------------------------------------
+    @staticmethod
+    def _lookup_reference(
+        to_translate: list[tuple[int, str]], target: str
+    ) -> dict[str, str]:
+        """Traductions issues de la base d'articles (référence article prioritaire).
+
+        Ne renvoie que les segments réellement couverts, pour ne pas court-circuiter
+        les fournisseurs sur les textes génériques (titres, totaux, mentions légales).
+        """
+        try:
+            from app.reference import get_index
+
+            index = get_index()
+        except Exception:  # pragma: no cover - base optionnelle
+            logger.warning("Base d'articles indisponible", exc_info=True)
+            return {}
+        if not len(index):
+            return {}
+
+        mapping: dict[str, str] = {}
+        for _position, text in to_translate:
+            found = index.lookup(text, target)
+            if found is None:
+                continue
+            _article, translation = found
+            translation = translation.strip()
+            if translation:
+                mapping[text] = translation
+        return mapping
 
     # -- Interne -----------------------------------------------------------
     def _translate_with_chain(
@@ -235,12 +288,23 @@ def clear_cache() -> None:
     _CACHE.clear()
 
 
+def _reference_diagnostics() -> dict[str, object]:
+    """État de la base d'articles (nombre de références, langues couvertes)."""
+    try:
+        from app.reference import get_index
+
+        return get_index().stats()
+    except Exception:  # pragma: no cover - jamais bloquant
+        return {"error": "index indisponible"}
+
+
 def chain_diagnostics() -> dict[str, object]:
     """État de la chaîne pour /api/diag (sans révéler de secret)."""
     return {
         "provider_env": _env("TRANSLATOR_PROVIDER", "auto") or "auto",
         "order": provider_order(),
         "cache_entries": len(_CACHE),
+        "reference": _reference_diagnostics(),
         "libretranslate_url": _env("LIBRETRANSLATE_URL", "https://libretranslate.com"),
         "requires_api_key": False,
     }

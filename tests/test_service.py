@@ -916,3 +916,127 @@ def test_oversized_but_accepted_pdf_is_optimized_before_processing(monkeypatch) 
     data, _fmt = asyncio.run(api_index._read_upload(upload))
     assert data == smaller
     assert "target" in called
+
+
+# ---------------------------------------------------------------------------
+# Base de référence d'articles : les traductions validées par l'entreprise
+# priment sur tout moteur automatique (clé = référence article).
+# ---------------------------------------------------------------------------
+
+
+def test_reference_index_loads_shipped_articles() -> None:
+    from app.reference import get_index
+
+    index = get_index()
+    assert len(index) >= 300, "la base d'articles doit être livrée avec l'application"
+    stats = index.stats()
+    assert stats["articles"] == len(index)
+    assert stats["with_arabic"] > 0
+
+
+def test_reference_article_lookup_by_code_beats_machine_translation() -> None:
+    """La référence article est la clé : la traduction officielle est utilisée."""
+    from app.reference import get_index
+
+    index = get_index()
+    article = index.find_code("16000000196")
+    assert article is not None
+    french = index.french_for(article)
+    assert "réservoir" in french.lower() or "reservoir" in french.lower()
+
+
+def test_reference_translation_is_used_before_network_providers() -> None:
+    """Le segment d'article ne doit pas dépendre d'un fournisseur réseau."""
+    from app.translation.chain import TranslationChain, clear_cache
+
+    clear_cache()
+    chain = TranslationChain()
+    result = chain.translate_segments(
+        ["Spare Part, Concealed Cistern ,Drainage Group"], source="en", target="fr"
+    )
+    assert result.translations[0].lower().startswith("pièce détachée")
+    assert result.reference_hits == 1
+
+
+def test_reference_translates_arabic_designation_for_arabic_target() -> None:
+    from app.translation.chain import TranslationChain, clear_cache
+
+    clear_cache()
+    chain = TranslationChain()
+    result = chain.translate_segments(
+        ["Stand Double"], source="en", target="ar"
+    )
+    assert any("\u0600" <= ch <= "\u06FF" for ch in result.translations[0])
+
+
+def test_terminology_keeps_brand_names_and_punctuation() -> None:
+    """Les marques/gammes et la ponctuation ne doivent pas être traduites ni perdues."""
+    from app.reference import get_index
+
+    text = get_index().terminology.translate("Faucet,Bathroom Mixer, Ibiza,Chrome")
+    assert "Ibiza" in text
+    assert "robinet" in text.lower()
+    assert "," in text
+
+
+def test_reference_never_translates_generic_text() -> None:
+    """Un segment hors base garde le comportement normal (pas de faux remplacement)."""
+    from app.translation.chain import TranslationChain, clear_cache
+
+    clear_cache()
+    result = TranslationChain().translate_segments(["Total HT"], source="en", target="fr")
+    assert result.reference_hits == 0
+    assert result.translations[0] == "Total HT"
+
+
+def test_reference_endpoints_report_and_search() -> None:
+    status = client.get("/api/reference")
+    assert status.status_code == 200
+    assert status.json()["reference"]["articles"] >= 300
+
+    found = client.get("/api/reference/search", params={"q": "16000000196"})
+    assert found.status_code == 200
+    payload = found.json()
+    assert payload["count"] == 1
+    assert payload["matches"][0]["code"] == "16000000196"
+
+    by_word = client.get("/api/reference/search", params={"q": "washbasin", "limit": 3})
+    assert by_word.status_code == 200
+    assert 1 <= by_word.json()["count"] <= 3
+
+
+def test_reference_import_from_csv_replaces_base(tmp_path, monkeypatch) -> None:
+    """Une base envoyée en CSV est lue et prise en compte immédiatement."""
+    import app.reference as reference
+
+    target = tmp_path / "articles.json"
+    monkeypatch.setattr(reference, "ARTICLES_FILE", target)
+    reference.clear_cache()
+
+    csv_content = (
+        "code;designation_en;designation_fr;designation_ar\n"
+        "TEST0001;Wall hung basin 60 cm;Vasque suspendue 60 cm;حوض معلق 60 سم\n"
+    )
+    response = client.post(
+        "/api/reference/import",
+        files={"file": ("base.csv", csv_content.encode("utf-8"), "text/csv")},
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["imported"] == 1
+    assert payload["total"] == 1
+
+    index = reference.get_index()
+    assert index.find_code("TEST0001") is not None
+    assert index.french_for(index.find_code("TEST0001")) == "Vasque suspendue 60 cm"
+
+    reference.clear_cache()
+
+
+def test_reference_import_rejects_unknown_format() -> None:
+    response = client.post(
+        "/api/reference/import",
+        files={"file": ("base.xlsx", b"PK\x03\x04donnees", "application/vnd.ms-excel")},
+    )
+    assert response.status_code == 415
+    assert response.json()["detail"]["code"] == "unsupported_reference_format"

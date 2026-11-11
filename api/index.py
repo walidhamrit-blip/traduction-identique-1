@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import logging
 from pathlib import Path
 from typing import Annotated
@@ -19,6 +20,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response
 
 from app.arabic_utils import format_arabic_text
 from app.config import (
+    IS_VERCEL,
     IMAGE_OPTIMIZE_ENABLED,
     IMAGE_OPTIMIZE_TARGET_BYTES,
     MAX_PAGES,
@@ -622,6 +624,193 @@ def get_sample_pdf() -> Response:
     )
 
 
+# ---------------------------------------------------------------------------
+# Base de référence d'articles (traductions validées, prioritaires)
+# ---------------------------------------------------------------------------
+
+# Jeton facultatif : s'il est défini (REFERENCE_ADMIN_TOKEN), l'import de la base
+# exige l'en-tête « X-Reference-Token ». Sans jeton, l'import reste ouvert.
+REFERENCE_ADMIN_TOKEN = (os.getenv("REFERENCE_ADMIN_TOKEN") or "").strip()
+
+
+@app.get(
+    "/reference",
+    summary="État de la base d'articles utilisée en priorité",
+)
+@app.get("/api/reference", include_in_schema=False)
+def reference_status() -> JSONResponse:
+    from app.reference import get_index
+
+    index = get_index()
+    return JSONResponse({"status": "ok", "reference": index.stats()})
+
+
+@app.get(
+    "/reference/search",
+    summary="Recherche dans la base (par référence article ou désignation)",
+)
+@app.get("/api/reference/search", include_in_schema=False)
+def reference_search(q: str = "", target_lang: str = "fr", limit: int = 20) -> JSONResponse:
+    """Retrouve les articles correspondant à une référence ou à une désignation.
+
+    Exemple : /api/reference/search?q=16000000196&target_lang=fr
+    """
+    from app.reference import get_index
+
+    index = get_index()
+    query = (q or "").strip()
+    if not query:
+        raise InvalidPdfError(
+            "Paramètre 'q' manquant.",
+            status_code=400,
+            code="missing_query",
+            hint="Indiquez une référence article ou un début de désignation.",
+        )
+
+    target = (target_lang or "fr").lower()
+    matches: list[dict[str, object]] = []
+    article = index.find_code(query)
+    candidates = [article] if article else []
+    if not candidates:
+        needle = query.casefold()
+        candidates = [
+            a
+            for a in index.articles.values()
+            if needle in a.designation_en.casefold()
+            or needle in a.designation_fr.casefold()
+            or needle in a.designation_ar
+            or needle in a.code.casefold()
+        ]
+
+    for item in candidates[: max(1, min(limit, 100))]:
+        matches.append(
+            {
+                "code": item.code,
+                "designation_en": item.designation_en,
+                "designation_fr": index.french_for(item),
+                "designation_ar": item.designation_ar,
+                "family": item.family,
+                "unit": item.unit,
+                "translation": index.translation_for(item, target),
+            }
+        )
+    return JSONResponse(
+        {"query": query, "target_lang": target, "count": len(matches), "matches": matches}
+    )
+
+
+@app.post(
+    "/reference/import",
+    summary="Importe une base d'articles (PDF, CSV ou JSON) sans redéploiement",
+)
+@app.post("/api/reference/import", include_in_schema=False)
+async def reference_import(
+    request: Request,
+    file: UploadFile,
+    replace: bool = True,
+) -> JSONResponse:
+    """Met à jour la base utilisée par les traductions.
+
+    - ``replace=true`` (défaut) : la base envoyée remplace l'ancienne ;
+    - ``replace=false`` : fusion, les références existantes sont mises à jour.
+
+    Sur Vercel, le système de fichiers n'est pas partagé entre instances : la
+    nouvelle base est enregistrée localement et **téléchargée** en retour, pour
+    être versionnée dans ``assets/reference/articles.json`` si besoin.
+    """
+    expected = REFERENCE_ADMIN_TOKEN
+    provided = request.headers.get("x-reference-token", "")
+    if expected and provided != expected:
+        raise InvalidPdfError(
+            "Import de la base non autorisé.",
+            status_code=403,
+            code="reference_import_forbidden",
+            hint="Fournissez l'en-tête X-Reference-Token avec la valeur configurée.",
+        )
+
+    from app.reference import ARTICLES_FILE, clear_cache, get_index
+    from app.reference_import import parse_reference_file
+
+    content = await file.read()
+    if not content:
+        raise EmptyPdfError("Le fichier de base est vide.")
+    if len(content) > MAX_UPLOAD_BYTES:
+        raise PayloadTooLargeError(
+            f"Fichier de base trop volumineux ({len(content) / (1024 * 1024):.1f} Mo)."
+        )
+
+    try:
+        records = parse_reference_file(file.filename or "", content)
+    except ValueError as exc:
+        raise InvalidPdfError(str(exc), status_code=415, code="unsupported_reference_format") from exc
+
+    if not records:
+        raise InvalidPdfError(
+            "Aucun article trouvé dans ce fichier.",
+            status_code=422,
+            code="reference_empty",
+            hint=(
+                "Le fichier doit contenir les colonnes Référence, Désignation, "
+                "Famille, Unité de vente (export « Liste article par Tarif »), "
+                "ou un CSV avec une colonne 'code'."
+            ),
+        )
+
+    current = get_index()
+    merged: dict[str, dict[str, str]] = {}
+    if not replace:
+        merged = {
+            code: {
+                "code": article.code,
+                "designation_en": article.designation_en,
+                "designation_fr": article.designation_fr,
+                "designation_ar": article.designation_ar,
+                "family": article.family,
+                "unit": article.unit,
+            }
+            for code, article in current.articles.items()
+        }
+    for record in records:
+        previous = merged.get(record["code"], {})
+        record.setdefault("designation_fr", "")
+        if not record.get("designation_fr"):
+            record["designation_fr"] = previous.get("designation_fr", "")
+        merged[record["code"]] = record
+
+    payload = {
+        "source": file.filename,
+        "count": len(merged),
+        "articles": list(merged.values()),
+    }
+    ARTICLES_FILE.parent.mkdir(parents=True, exist_ok=True)
+    ARTICLES_FILE.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    clear_cache()
+    index = get_index()
+
+    headers = {
+        "X-Reference-Count": str(len(index)),
+        "Content-Disposition": build_content_disposition("articles.json", "reference"),
+    }
+    return JSONResponse(
+        {
+            "status": "ok",
+            "imported": len(records),
+            "total": len(index),
+            "saved_to": str(ARTICLES_FILE),
+            "on_vercel": IS_VERCEL,
+            "hint": (
+                "Sur Vercel, cette mise à jour n'est pas partagée entre instances : "
+                "le fichier 'articles.json' renvoyé peut être versionné dans "
+                "assets/reference/ pour être déployé durablement."
+                if IS_VERCEL
+                else None
+            ),
+            "reference": index.stats(),
+        },
+        headers=headers,
+    )
+
+
 @app.get("/health", summary="Vérification de l'état du service et des polices TTF")
 @app.get("/api/health", include_in_schema=False)
 def healthcheck() -> dict:
@@ -672,6 +861,7 @@ def diagnostics() -> JSONResponse:
         ),
         "dependencies": _dependency_versions(),
         "render": _render_selftest(),
+        "reference": _reference_diagnostics(),
     }
     return JSONResponse(payload)
 
@@ -731,6 +921,27 @@ def _render_selftest() -> dict[str, object]:
         result["merge_pymupdf"] = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
     result["font_used"] = _select_font_name(TargetLang.FR)
     return result
+
+
+def _reference_diagnostics() -> dict[str, object]:
+    """Base d'articles : nombre de références et langues couvertes."""
+    try:
+        from app.reference import get_index
+
+        index = get_index()
+        stats = index.stats()
+        stats["file"] = str(index_stats_path())
+        stats["available"] = len(index) > 0
+        return stats
+    except Exception as exc:  # pragma: no cover - jamais bloquant
+        return {"available": False, "error": f"{type(exc).__name__}: {exc}"}
+
+
+def index_stats_path() -> str:
+    """Chemin du fichier de base d'articles (diagnostic)."""
+    from app.reference import ARTICLES_FILE
+
+    return str(ARTICLES_FILE)
 
 
 def _dependency_versions() -> dict[str, str]:

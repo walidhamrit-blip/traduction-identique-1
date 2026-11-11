@@ -190,6 +190,60 @@ Réglages associés (variables d'environnement) :
 
 ---
 
+## Base de référence d'articles (traductions prioritaires)
+
+L'entreprise possède une liste d'articles avec leur désignation officielle. Pour ces
+articles, la traduction validée **prime toujours** sur un moteur automatique : il
+serait absurde de laisser un traducteur en ligne réinventer
+« Spare Part, Concealed Cistern, Drainage Group ».
+
+### Fonctionnement
+
+La base est consultée **avant** les fournisseurs réseau, dans cet ordre :
+
+1. **référence article** (ex. `16000000196`) trouvée dans le segment → traduction
+   officielle de cet article. C'est la clé de référence : elle fonctionne même
+   quand la référence est une ligne isolée dans une grande facture ;
+2. sinon, **désignation** comparée au segment (casse, accents, ponctuation et ordre
+   des mots ignorés) ;
+3. sinon, traduction automatique habituelle (inchangée).
+
+Un segment hors base (« Total HT », titres, totaux) garde le comportement normal :
+la base enrichit, elle ne remplace pas la traduction.
+
+### Contenu livré
+
+- `assets/reference/articles.json` — **369 articles** extraits de l'export
+  « Liste article par Tarif » : référence, désignation anglaise, désignation arabe,
+  famille, unité de vente ;
+- `assets/reference/terminologie_fr.json` — terminologie métier anglais → français
+  (~215 entrées : *wall hang* → suspendu, *concealed cistern* → réservoir encastré,
+  *spare part* → pièce détachée…). Elle permet de traduire immédiatement les
+  désignations vers le français, en conservant les marques et les dimensions ;
+- `assets/reference/designations_fr_a_completer.csv` — **modèle à remplir** : une
+  ligne par désignation, avec une proposition automatique. Toute valeur saisie dans
+  la colonne `designation_fr` devient prioritaire.
+
+### Alimenter ou mettre à jour la base
+
+| Méthode | Commande |
+| --- | --- |
+| Nouvel export PDF de la gestion | `python tools/build_reference.py "Liste article.pdf"` |
+| Modèle français à remplir | `python tools/export_french_template.py` |
+| Mise à jour sans redéploiement | `POST /api/reference/import` (PDF, CSV ou JSON) |
+
+Vérifications disponibles :
+
+- `GET /api/reference` → nombre de références et langues couvertes ;
+- `GET /api/reference/search?q=16000000196` → l'article et sa traduction ;
+- `GET /api/diag` → bloc `reference` (base chargée ou non).
+
+> Sur Vercel, le système de fichiers n'est pas partagé entre instances : un import
+> via l'API s'applique à l'instance courante et renvoie le fichier `articles.json`
+> à versionner. Pour une mise à jour durable, commitez
+> `assets/reference/articles.json` (ou définissez `REFERENCE_ADMIN_TOKEN` pour
+> protéger l'import).
+
 ## Traduction **gratuite**, sans clé API
 
 Trois fournisseurs gratuits sont essayés dans l'ordre, sans carte bancaire :
