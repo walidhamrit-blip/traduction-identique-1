@@ -9,7 +9,12 @@ import time
 import unicodedata
 from dataclasses import dataclass
 
-from app.config import SOURCE_LANG, TRANSLATE_ENABLED, TRANSLATE_TIME_BUDGET_S
+from app.config import (
+    PAGE_COLORS_ENABLED,
+    SOURCE_LANG,
+    TRANSLATE_ENABLED,
+    TRANSLATE_TIME_BUDGET_S,
+)
 from app.errors import PdfProcessingError, PdfServiceError, ScannedPdfError
 from app.extractor import extract_pdf_layout
 from app.renderer import (
@@ -163,6 +168,25 @@ def _apply_edits(
             page_out.append((moved, text))
         rebuilt.append(page_out)
     return rebuilt
+
+
+def _page_colors(pdf_bytes: bytes, pages: list[ExtractedPage]) -> list[list[object]] | None:
+    """Couleurs réelles (fond + encre) de chaque bloc, pour un rendu identique.
+
+    Sans cette mesure, le masque du calque est blanc : sur un tableau à fonds gris
+    ou colorés, cela laisse des « trous » blancs très visibles.
+    """
+    if not PAGE_COLORS_ENABLED:
+        return None
+    try:
+        from app.page_colors import analyze_pages
+
+        rects = [[(b.x0, b.y0, b.x1, b.y1) for b in page.blocks] for page in pages]
+        colors = analyze_pages(pdf_bytes, rects)
+        return colors or None
+    except Exception:  # pragma: no cover - jamais bloquant
+        logger.info("Analyse des couleurs indisponible", exc_info=True)
+        return None
 
 
 def _render_with_fallbacks(
@@ -323,6 +347,7 @@ def translate_pdf_bytes(
         "style": style,
         "edits": edits,
         "page_boxes": page_boxes,
+        "page_colors": _page_colors(pdf_bytes, pages),
     }
 
     output, used_fallback, failure = _render_with_fallbacks(pdf_bytes, overlay_kwargs)

@@ -347,6 +347,7 @@ def build_overlay_pdf(
     edits: dict[str, BlockEdit] | None = None,
     *,
     page_boxes: list[tuple[float, float]] | None = None,
+    page_colors: list[list[object]] | None = None,
 ) -> bytes:
     """Construit le calque ReportLab à appliquer sur le PDF original.
 
@@ -428,12 +429,21 @@ def build_overlay_pdf(
             )
             prepared.append((resolved_block, candidate, needs_replacement))
 
-        # --- Passe 1 : masques blancs (seulement là où le texte est réécrit) ---
+        # Couleurs réelles observées sur la page (fond de cellule, encre d'origine).
+        observed = page_colors[page_index] if page_colors and page_index < len(page_colors) else []
+
+        # --- Passe 1 : masques de la couleur EXACTE du fond original ---
+        # Peindre en blanc créait des trous visibles sur les tableaux gris : on
+        # reprend la couleur mesurée dans le rendu de la page.
         c.saveState()
-        c.setFillColorRGB(1.0, 1.0, 1.0)
-        for block, _, needs_replacement in prepared:
+        for position, (block, _, needs_replacement) in enumerate(prepared):
             if not needs_replacement:
                 continue
+            colors = observed[position] if position < len(observed) else None
+            background = _background_for(colors, style)
+            if background is None:
+                continue  # fond non uniforme : on ne masque pas, l'original reste lisible
+            c.setFillColorRGB(*background)
             rx0 = max(0.0, block.x0 + style.offset_x - mask_padding)
             ry0 = max(0.0, block.y0 + style.offset_y - mask_padding)
             rx1 = min(width, block.x1 + style.offset_x + mask_padding)
@@ -443,10 +453,11 @@ def build_overlay_pdf(
 
         # --- Passe 2 : écriture du texte traduit stylé ---
         c.saveState()
-        c.setFillColorRGB(*text_color)
-        for block, text, needs_replacement in prepared:
+        for position, (block, text, needs_replacement) in enumerate(prepared):
             if not needs_replacement or not text:
                 continue
+            colors = observed[position] if position < len(observed) else None
+            c.setFillColorRGB(*_text_color_for(colors, style))
 
             lines, font_size, line_height = _fit_text_with_style(
                 text, block, font_name, is_arabic, style
@@ -505,6 +516,37 @@ def merge_overlay_with_pymupdf(original_pdf_bytes: bytes, overlay_pdf_bytes: byt
     finally:
         document.close()
         overlay.close()
+
+
+def _background_for(colors: object, style: StyleOptions) -> tuple[float, float, float] | None:
+    """Couleur du masque : celle du fond réel, sinon le blanc configuré.
+
+    Retourne ``None`` quand le fond n'est pas uniforme (photo, dégradé) et que
+    l'utilisateur n'a pas imposé de couleur : mieux vaut ne rien masquer que
+    peindre un rectangle visible.
+    """
+    background = getattr(colors, "background", None) if colors else None
+    if background is not None:
+        return tuple(background)  # type: ignore[return-value]
+    if colors is not None and style.color:
+        # Page analysée mais sans fond uniforme : on n'invente pas de couleur.
+        return None
+    return (1.0, 1.0, 1.0)
+
+
+def _text_color_for(colors: object, style: StyleOptions) -> tuple[float, float, float]:
+    """Couleur du texte traduit : celle d'origine, sauf choix explicite de l'utilisateur.
+
+    Un texte blanc sur fond gris foncé doit le rester, sinon il devient illisible.
+    La préférence de l'utilisateur (éditeur) reste prioritaire si elle a été changée.
+    """
+    chosen = _hex_to_rgb(style.color)
+    if chosen != _hex_to_rgb("#14171E"):
+        return chosen  # l'utilisateur a choisi une couleur : on la respecte
+    ink = getattr(colors, "ink", None) if colors else None
+    if ink is not None:
+        return tuple(ink)  # type: ignore[return-value]
+    return chosen
 
 
 def _resolve_font_file(font_name: str, target_lang: TargetLang) -> Path | None:
@@ -574,6 +616,7 @@ def build_overlay_pdf_fallback(
     edits: dict[str, BlockEdit] | None = None,
     *,
     page_boxes: list[tuple[float, float]] | None = None,
+    page_colors: list[list[object]] | None = None,
 ) -> bytes:
     """Calque de secours, écrit sans ReportLab (voir `app.modules pdf_writer`).
 
@@ -612,6 +655,7 @@ def build_overlay_pdf_fallback(
             width, height = page.width, page.height
 
         content = PageContent(width=max(1.0, float(width)), height=max(1.0, float(height)))
+        observed = page_colors[page_index] if page_colors and page_index < len(page_colors) else []
 
         for position, (block, translated_text) in enumerate(page_items):
             bid = block_id_of(block, page_index, position)
@@ -649,7 +693,8 @@ def build_overlay_pdf_fallback(
             y0 = max(0.0, target_block.y0 + style.offset_y - mask_padding)
             x1 = min(width, target_block.x1 + style.offset_x + mask_padding)
             y1 = min(height, target_block.y1 + style.offset_y + mask_padding)
-            content.masks.append((x0, y0, x1, y1))
+            colors = observed[position] if position < len(observed) else None
+            content.masks.append((x0, y0, x1, y1, _background_for(colors, style)))
 
             lines, font_size, line_height = _fallback_lines(
                 candidate, target_block, font_key, writer, is_arabic, style
@@ -672,6 +717,7 @@ def build_overlay_pdf_fallback(
                         y=baseline_y,
                         font_size=font_size,
                         font_key=font_key,
+                        color=_text_color_for(colors, style),
                     )
                 )
 
@@ -680,8 +726,6 @@ def build_overlay_pdf_fallback(
             content.runs = []
         writer.add_page(content)
 
-    # Couleur du texte : le writer écrit en noir ; on rétablit la couleur voulue.
-    _ = text_color
     return writer.build()
 
 
