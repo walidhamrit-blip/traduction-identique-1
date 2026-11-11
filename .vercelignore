@@ -10,3 +10,4 @@ samples/
 .pytest_cache/
 *.md
 !README.md
+assets/reference/*.csv
