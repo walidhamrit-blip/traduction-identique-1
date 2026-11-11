@@ -95,7 +95,27 @@ Configuration associée :
   3. renvoie un `413` explicite (avec conseil : découper le PDF ou choisir TXT/DOCX)
      si le fichier reste trop lourd.
 
-### Mise en forme identique à l'original (fonds de tableau, texte blanc)
+### Mise en forme strictement identique à l'original
+
+La méthode a changé : le texte d'origine n'est plus **recouvert** par un rectangle,
+il est **supprimé par rédaction PDF** (`Page.apply_redactions`, voir
+`app/redaction.py`). Le fond du document reste alors bit pour bit intact.
+
+| Paramètre | Effet |
+| --- | --- |
+| `text=PDF_REDACT_TEXT_REMOVE` | seul le texte est retiré |
+| `graphics=PDF_REDACT_LINE_ART_NONE` | fonds de cellules, bandeaux et bordures conservés |
+| `images=PDF_REDACT_IMAGE_NONE` | logos, trames et scans conservés |
+
+C'est la seule méthode qui reste fidèle quand une cellule colorée est **plus
+petite que son texte**, quand le fond est une **image**, ou quand la bande a une
+largeur irrégulière — cas où un rectangle, même bien coloré, ne peut pas
+reproduire exactement le décor.
+
+Le texte traduit reprend la **couleur de l'encre d'origine** mesurée sur la page
+(texte blanc sur bandeau gris reste blanc). Si la rédaction est indisponible, le
+rendu retombe automatiquement sur les masques colorés mesurés.
+
 
 Le calque de traduction recouvre le texte d'origine par un rectangle. Ce rectangle
 était peint en **blanc pur**, ce qui laissait des « remplissages blancs » très

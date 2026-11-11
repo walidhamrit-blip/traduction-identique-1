@@ -189,6 +189,36 @@ def _page_colors(pdf_bytes: bytes, pages: list[ExtractedPage]) -> list[list[obje
         return None
 
 
+def _strip_original_text(pdf_bytes: bytes, overlay_kwargs: dict) -> bytes | None:
+    """Supprime le texte d'origine qui va être traduit (fond laissé intact).
+
+    Retourne ``None`` quand la rédaction n'est pas disponible : le rendu utilise
+    alors des masques colorés (mesurés sur la page) au lieu d'une suppression.
+    """
+    try:
+        from app.redaction import strip_text
+
+        pages = overlay_kwargs.get("pages") or []
+        translated = overlay_kwargs.get("translated_blocks_per_page") or []
+        rects_per_page: list[list[tuple[float, float, float, float]]] = []
+        for page_index, page in enumerate(pages):
+            items = translated[page_index] if page_index < len(translated) else []
+            rects: list[tuple[float, float, float, float]] = []
+            for block, text in items:
+                original = " ".join(block.text.split())
+                candidate = " ".join((text or "").split())
+                if candidate and candidate.casefold() != original.casefold():
+                    rects.append((block.x0, block.y0, block.x1, block.y1))
+            rects_per_page.append(rects)
+        stem = strip_text(pdf_bytes, rects_per_page)
+        if stem is not None:
+            logger.info("Texte d'origine retiré sans altérer le fond (rédaction).")
+        return stem
+    except Exception:  # pragma: no cover - jamais bloquant
+        logger.info("Rédaction du texte indisponible", exc_info=True)
+        return None
+
+
 def _render_with_fallbacks(
     pdf_bytes: bytes, overlay_kwargs: dict
 ) -> tuple[bytes, bool, str]:
@@ -205,6 +235,12 @@ def _render_with_fallbacks(
 
     Retourne ``(pdf, secours_utilisé, détail_de_l_échec)``.
     """
+    # Le texte d'origine est supprimé **sans repeindre le fond** (rédaction) :
+    # le décor du document (fonds de cellules, bandeaux, images) reste alors
+    # strictement intact, ce qui garantit une mise en forme identique.
+    stem_bytes = _strip_original_text(pdf_bytes, overlay_kwargs)
+    masks = stem_bytes is None  # pas de rédaction possible -> masques colorés
+
     attempts: list[tuple[str, callable, callable]] = [
         ("reportlab+pypdf", build_overlay_pdf, merge_overlay_with_original),
         ("interne+pypdf", build_overlay_pdf_fallback, merge_overlay_with_original),
@@ -213,8 +249,8 @@ def _render_with_fallbacks(
     errors: list[str] = []
     for name, render, merge in attempts:
         try:
-            overlay = render(**overlay_kwargs)
-            output = merge(pdf_bytes, overlay)
+            overlay = render(**{**overlay_kwargs, "with_masks": masks})
+            output = merge(stem_bytes if stem_bytes is not None else pdf_bytes, overlay)
         except PdfServiceError:
             raise
         except Exception as exc:  # noqa: BLE001 - on veut tester le moteur suivant

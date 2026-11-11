@@ -348,6 +348,7 @@ def build_overlay_pdf(
     *,
     page_boxes: list[tuple[float, float]] | None = None,
     page_colors: list[list[object]] | None = None,
+    with_masks: bool = True,
 ) -> bytes:
     """Construit le calque ReportLab à appliquer sur le PDF original.
 
@@ -437,7 +438,7 @@ def build_overlay_pdf(
         # reprend la couleur mesurée dans le rendu de la page.
         c.saveState()
         for position, (block, _, needs_replacement) in enumerate(prepared):
-            if not needs_replacement:
+            if not needs_replacement or not with_masks:
                 continue
             colors = observed[position] if position < len(observed) else None
             background = _background_for(colors, style)
@@ -617,6 +618,7 @@ def build_overlay_pdf_fallback(
     *,
     page_boxes: list[tuple[float, float]] | None = None,
     page_colors: list[list[object]] | None = None,
+    with_masks: bool = True,
 ) -> bytes:
     """Calque de secours, écrit sans ReportLab (voir `app.modules pdf_writer`).
 
@@ -694,7 +696,8 @@ def build_overlay_pdf_fallback(
             x1 = min(width, target_block.x1 + style.offset_x + mask_padding)
             y1 = min(height, target_block.y1 + style.offset_y + mask_padding)
             colors = observed[position] if position < len(observed) else None
-            content.masks.append((x0, y0, x1, y1, _background_for(colors, style)))
+            if with_masks:
+                content.masks.append((x0, y0, x1, y1, _background_for(colors, style)))
 
             lines, font_size, line_height = _fallback_lines(
                 candidate, target_block, font_key, writer, is_arabic, style

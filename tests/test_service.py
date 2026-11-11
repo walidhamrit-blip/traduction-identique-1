@@ -1121,3 +1121,133 @@ def test_masking_can_be_disabled_by_configuration(monkeypatch) -> None:
     assert reloaded.PAGE_COLORS_ENABLED is False
     monkeypatch.delenv("PDF_PAGE_COLORS", raising=False)
     importlib.reload(config_module)
+
+
+# ---------------------------------------------------------------------------
+# Mise en forme strictement identique : le texte d'origine est SUPPRIMÉ par
+# rédaction (fond, bordures et images intacts) au lieu d'être recouvert par un
+# rectangle. C'est la seule méthode qui reste fidèle quand une cellule colorée
+# est plus petite que son texte, ou quand le fond est une image.
+# ---------------------------------------------------------------------------
+
+
+def test_redaction_removes_text_but_keeps_background_graphics() -> None:
+    """Supprimer le texte ne doit pas toucher au fond coloré (bande grise)."""
+    import pymupdf
+
+    from app.extractor import extract_pdf_layout
+    from app.redaction import strip_text
+
+    document = pymupdf.open()
+    page = document.new_page(width=595, height=300)
+    page.draw_rect(pymupdf.Rect(40, 40, 500, 70), color=None, fill=(0.62, 0.62, 0.62))
+    page.insert_text((50, 60), "Payment terms", fontsize=10, color=(1, 1, 1))
+    pdf = document.tobytes()
+
+    block = extract_pdf_layout(pdf)[0].blocks[0]
+    output = strip_text(pdf, [[(block.x0, block.y0, block.x1, block.y1)]])
+    assert output is not None
+
+    result = pymupdf.open(stream=output, filetype="pdf")
+    try:
+        assert result[0].get_text().strip() == "", "le texte d'origine doit disparaître"
+        pixmap = result[0].get_pixmap(dpi=100)
+        scale = pixmap.width / result[0].rect.width
+        sample = pixmap.pixel(int(400 * scale), int(55 * scale))
+        assert abs(sample[0] - 158) < 25, f"le fond gris doit rester gris : {sample}"
+    finally:
+        result.close()
+
+
+def test_redaction_never_touches_background_images() -> None:
+    """Un logo ou une trame de fond ne doit jamais être supprimé."""
+    import pymupdf
+
+    from app.extractor import extract_pdf_layout
+    from app.redaction import strip_text
+
+    document = pymupdf.open()
+    page = document.new_page(width=400, height=300)
+    pixmap = pymupdf.Pixmap(pymupdf.csRGB, pymupdf.IRect(0, 0, 400, 300))
+    pixmap.set_rect(pixmap.irect, (230, 235, 245))
+    page.insert_image(pymupdf.Rect(0, 0, 400, 300), pixmap=pixmap)
+    page.insert_text((40, 150), "Text over the image", fontsize=14, color=(0, 0, 0))
+    pdf = document.tobytes()
+
+    block = extract_pdf_layout(pdf)[0].blocks[0]
+    output = strip_text(pdf, [[(block.x0, block.y0, block.x1, block.y1)]])
+    assert output is not None
+
+    result = pymupdf.open(stream=output, filetype="pdf")
+    try:
+        assert result[0].get_text().strip() == ""
+        assert len(result[0].get_images()) == 1, "l'image de fond doit être conservée"
+        rendered = result[0].get_pixmap(dpi=72)
+        assert rendered.pixel(350, 40)[0] > 200, "le fond doit garder sa couleur"
+    finally:
+        result.close()
+
+
+def test_translation_uses_redaction_and_keeps_light_text_on_dark_band() -> None:
+    """Le texte traduit garde la couleur d'origine (blanc sur bandeau gris)."""
+    import pymupdf
+
+    from app.extractor import extract_pdf_layout
+    from app.page_colors import analyze_pages
+    from app.pipeline import _page_colors, _strip_original_text
+    from app.renderer import build_overlay_pdf, merge_overlay_with_original
+    from app.schemas import TargetLang
+
+    document = pymupdf.open()
+    page = document.new_page(width=595, height=300)
+    page.draw_rect(pymupdf.Rect(40, 40, 500, 70), color=None, fill=(0.62, 0.62, 0.62))
+    page.insert_text((50, 60), "Loading date", fontsize=10, color=(1, 1, 1))
+    pdf = document.tobytes()
+
+    pages = extract_pdf_layout(pdf)
+    per_page = [[(block, "Date de chargement") for block in pages[0].blocks]]
+    kwargs = {
+        "pages": pages,
+        "translated_blocks_per_page": per_page,
+        "target_lang": TargetLang.FR,
+    }
+    colors = _page_colors(pdf, pages)
+    assert colors and colors[0][0].ink is not None
+    assert min(colors[0][0].ink) > 0.8, "le texte blanc du bandeau doit être détecté"
+
+    stem = _strip_original_text(pdf, {**kwargs, "page_boxes": None})
+    assert stem is not None, "la rédaction du texte doit réussir"
+    overlay = build_overlay_pdf(**kwargs, page_colors=colors, with_masks=False)
+    output = merge_overlay_with_original(stem, overlay)
+
+    result = pymupdf.open(stream=output, filetype="pdf")
+    try:
+        # Le texte est renvoyé à la ligne par le rendu : on compare sans les sauts.
+        assert "Date de chargement" in " ".join(result[0].get_text().split())
+        pixmap = result[0].get_pixmap(dpi=100)
+        scale = pixmap.width / result[0].rect.width
+        # Le bandeau doit rester gris, sans trou blanc.
+        sample = pixmap.pixel(int(450 * scale), int(55 * scale))
+        assert abs(sample[0] - 158) < 30, f"le bandeau a été altéré : {sample}"
+    finally:
+        result.close()
+
+
+def test_page_colors_detects_white_ink_on_uniform_background() -> None:
+    """Encre claire sur fond uniforme : elle doit être mesurée, pas ignorée."""
+    import pymupdf
+
+    from app.extractor import extract_pdf_layout
+    from app.page_colors import analyze_pages
+
+    document = pymupdf.open()
+    page = document.new_page(width=595, height=200)
+    page.draw_rect(pymupdf.Rect(20, 20, 560, 60), color=None, fill=(0.45, 0.45, 0.45))
+    page.insert_text((40, 45), "Customs office", fontsize=12, color=(1, 1, 1))
+    pdf = document.tobytes()
+
+    pages = extract_pdf_layout(pdf)
+    rects = [[(b.x0, b.y0, b.x1, b.y1) for b in page.blocks] for page in pages]
+    colors = analyze_pages(pdf, rects)[0][0]
+    assert colors.background is not None and colors.background[0] < 0.6
+    assert colors.ink is not None and min(colors.ink) > 0.85
